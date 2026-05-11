@@ -73,9 +73,12 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun ExtractUniqueFramesApp(vm: ExtractViewModel = viewModel()) {
     val state by vm.state.collectAsStateWithLifecycle()
+    val selectedMode by vm.mode.collectAsStateWithLifecycle()
 
     when (val s = state) {
         is ExtractViewModel.UiState.Idle -> HomeScreen(
+            selectedMode = selectedMode,
+            onModeChange = vm::setMode,
             onStartExtraction = { uri, config -> vm.startExtraction(uri, config) }
         )
         is ExtractViewModel.UiState.Processing -> ProcessingScreen(
@@ -96,8 +99,13 @@ fun ExtractUniqueFramesApp(vm: ExtractViewModel = viewModel()) {
 
 // ─── Home ────────────────────────────────────────────────────────────────────
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun HomeScreen(onStartExtraction: (Uri, FrameExtractor.Config) -> Unit) {
+fun HomeScreen(
+    selectedMode: FrameExtractor.Mode,
+    onModeChange: (FrameExtractor.Mode) -> Unit,
+    onStartExtraction: (Uri, FrameExtractor.Config) -> Unit
+) {
     val context = LocalContext.current
     var selectedUri by remember { mutableStateOf<Uri?>(null) }
     var settingsExpanded by remember { mutableStateOf(false) }
@@ -106,6 +114,7 @@ fun HomeScreen(onStartExtraction: (Uri, FrameExtractor.Config) -> Unit) {
     var colorDistance by remember { mutableFloatStateOf(20f) }
     var frameIntervalMs by remember { mutableFloatStateOf(200f) }
     var filterTouchEffects by remember { mutableStateOf(true) }
+    var stabilityRunLength by remember { mutableFloatStateOf(5f) }
 
     // Held while we wait for WRITE_EXTERNAL_STORAGE on API ≤ 28
     var pendingUri by remember { mutableStateOf<Uri?>(null) }
@@ -231,6 +240,35 @@ fun HomeScreen(onStartExtraction: (Uri, FrameExtractor.Config) -> Unit) {
                     exit = shrinkVertically()
                 ) {
                     Column(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
+
+                        // Mode selector
+                        Text(
+                            "Extraction mode",
+                            style = MaterialTheme.typography.bodyMedium,
+                            modifier = Modifier.padding(bottom = 6.dp)
+                        )
+                        SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+                            SegmentedButton(
+                                selected = selectedMode == FrameExtractor.Mode.INTERVAL,
+                                onClick = { onModeChange(FrameExtractor.Mode.INTERVAL) },
+                                shape = SegmentedButtonDefaults.itemShape(index = 0, count = 2),
+                                label = { Text("Interval") }
+                            )
+                            SegmentedButton(
+                                selected = selectedMode == FrameExtractor.Mode.SCENE_BASED,
+                                onClick = { onModeChange(FrameExtractor.Mode.SCENE_BASED) },
+                                shape = SegmentedButtonDefaults.itemShape(index = 1, count = 2),
+                                label = { Text("Scene-based") }
+                            )
+                        }
+
+                        Spacer(Modifier.height(4.dp))
+
+                        // pHash + colour thresholds — visible in both modes
+                        val thresholdDescription = if (selectedMode == FrameExtractor.Mode.INTERVAL)
+                            "Hamming distance; lower = stricter dedup"
+                        else
+                            "Transition sensitivity; lower = detects smaller changes"
                         SliderSetting(
                             label = "pHash threshold",
                             value = pHashThreshold,
@@ -238,8 +276,12 @@ fun HomeScreen(onStartExtraction: (Uri, FrameExtractor.Config) -> Unit) {
                             valueRange = 1f..25f,
                             steps = 23,
                             display = { it.roundToInt().toString() },
-                            description = "Hamming distance; lower = stricter dedup"
+                            description = thresholdDescription
                         )
+                        val colourDescription = if (selectedMode == FrameExtractor.Mode.INTERVAL)
+                            "RGB Euclidean; lower = stricter dedup"
+                        else
+                            "Colour change sensitivity; lower = detects subtler shifts"
                         SliderSetting(
                             label = "Colour distance",
                             value = colorDistance,
@@ -247,17 +289,35 @@ fun HomeScreen(onStartExtraction: (Uri, FrameExtractor.Config) -> Unit) {
                             valueRange = 0f..100f,
                             steps = 19,
                             display = { it.roundToInt().toString() },
-                            description = "RGB Euclidean; lower = stricter dedup"
+                            description = colourDescription
                         )
-                        SliderSetting(
-                            label = "Frame interval",
-                            value = frameIntervalMs,
-                            onValueChange = { frameIntervalMs = it },
-                            valueRange = 50f..2000f,
-                            steps = 38,
-                            display = { "${it.roundToInt()} ms" },
-                            description = "How often to sample the video"
-                        )
+
+                        // Interval-only setting
+                        if (selectedMode == FrameExtractor.Mode.INTERVAL) {
+                            SliderSetting(
+                                label = "Frame interval",
+                                value = frameIntervalMs,
+                                onValueChange = { frameIntervalMs = it },
+                                valueRange = 50f..2000f,
+                                steps = 38,
+                                display = { "${it.roundToInt()} ms" },
+                                description = "How often to sample the video"
+                            )
+                        }
+
+                        // Scene-based-only setting
+                        if (selectedMode == FrameExtractor.Mode.SCENE_BASED) {
+                            SliderSetting(
+                                label = "Frames unchanged before capture",
+                                value = stabilityRunLength,
+                                onValueChange = { stabilityRunLength = it },
+                                valueRange = 3f..20f,
+                                steps = 16,
+                                display = { it.roundToInt().toString() },
+                                description = "Consecutive stable frames required to save a key frame"
+                            )
+                        }
+
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -288,10 +348,12 @@ fun HomeScreen(onStartExtraction: (Uri, FrameExtractor.Config) -> Unit) {
                     launchExtraction(
                         uri,
                         FrameExtractor.Config(
+                            mode = selectedMode,
                             pHashThreshold = pHashThreshold.roundToInt(),
                             colorDistanceThreshold = colorDistance,
                             frameIntervalMs = frameIntervalMs.roundToInt().toLong(),
-                            filterTouchEffects = filterTouchEffects
+                            filterTouchEffects = filterTouchEffects,
+                            stabilityRunLength = stabilityRunLength.roundToInt()
                         )
                     )
                 }

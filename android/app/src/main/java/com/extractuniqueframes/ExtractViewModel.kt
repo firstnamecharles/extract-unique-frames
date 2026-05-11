@@ -22,8 +22,16 @@ class ExtractViewModel(application: Application) : AndroidViewModel(application)
     private val _state = MutableStateFlow<UiState>(UiState.Idle)
     val state: StateFlow<UiState> = _state.asStateFlow()
 
+    /** Persists the user's mode selection across Idle → Processing → Done cycles. */
+    private val _mode = MutableStateFlow(FrameExtractor.Mode.INTERVAL)
+    val mode: StateFlow<FrameExtractor.Mode> = _mode.asStateFlow()
+
     private val extractor = FrameExtractor(application)
     private var job: Job? = null
+
+    fun setMode(mode: FrameExtractor.Mode) {
+        _mode.value = mode
+    }
 
     fun startExtraction(videoUri: Uri, config: FrameExtractor.Config) {
         job?.cancel()
