@@ -87,8 +87,9 @@ class FrameExtractor(private val context: Context) {
 
                         if (isUnique) {
                             val file = File(outputDir, "frame_%05d.jpg".format(saved.size))
+                            val bmp = currBitmap
                             FileOutputStream(file).use { out ->
-                                currBitmap.compress(Bitmap.CompressFormat.JPEG, 90, out)
+                                bmp.compress(Bitmap.CompressFormat.JPEG, 90, out)
                             }
                             saved.add(file)
                             lastHash = hash
