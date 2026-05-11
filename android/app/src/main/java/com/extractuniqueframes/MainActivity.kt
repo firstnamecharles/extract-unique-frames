@@ -699,7 +699,8 @@ private fun FrameTimeline(
 
     Row(modifier = modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
         BoxWithConstraints(modifier = Modifier.weight(1f).height(48.dp)) {
-            val baseWidthPx = with(density) { maxWidth.toPx() }
+            val baseWidth = maxWidth
+            val baseWidthPx = with(density) { baseWidth.toPx() }
             val tapThresholdPx = with(density) { 24.dp.toPx() }
             Row(
                 modifier = Modifier
@@ -739,7 +740,7 @@ private fun FrameTimeline(
                         }
                     }
             ) {
-                Canvas(modifier = Modifier.width(maxWidth * zoom).fillMaxHeight()) {
+                Canvas(modifier = Modifier.width(baseWidth * zoom).fillMaxHeight()) {
                     val cy = size.height / 2f
                     drawLine(
                         color = outline.copy(alpha = 0.35f),
