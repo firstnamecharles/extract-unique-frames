@@ -17,10 +17,9 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.awaitEachGesture
-import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.horizontalScroll
-import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
@@ -701,60 +700,41 @@ private fun FrameTimeline(
     Row(modifier = modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
         BoxWithConstraints(modifier = Modifier.weight(1f).height(48.dp)) {
             val baseWidthPx = with(density) { maxWidth.toPx() }
+            val tapThresholdPx = with(density) { 24.dp.toPx() }
             Row(
                 modifier = Modifier
                     .fillMaxSize()
                     .horizontalScroll(scrollState, enabled = false)
+                    // Tap handler: find nearest tick in content coordinates.
                     .pointerInput(frameTimestampsMs, videoDurationMs) {
-                        val tapThresholdPx = with(density) { 24.dp.toPx() }
-                        awaitEachGesture {
-                            val firstDown = awaitFirstDown(requireUnconsumed = false)
-                            val downPos = firstDown.position
-                            var prevSpan = 0f
-                            var isTapCandidate = true
-                            var maxMovement = 0f
-                            gesture@ while (true) {
-                                val event = awaitPointerEvent(PointerEventPass.Initial)
-                                val pressed = event.changes.filter { it.pressed }
-                                if (pressed.isEmpty()) break@gesture
-                                val first = pressed.firstOrNull { it.id == firstDown.id }
-                                val second = pressed.firstOrNull { it.id != firstDown.id }
-                                if (first == null) {
-                                    event.changes.forEach { it.consume() }
-                                    break@gesture
-                                }
-                                if (second != null) {
-                                    isTapCandidate = false
-                                    val span = (first.position - second.position).getDistance()
-                                    val centroid = (first.position + second.position) / 2f
-                                    if (prevSpan > 0f && span > 0f) {
-                                        val oldZoom = zoom
-                                        val newZoom = (zoom * span / prevSpan).coerceIn(1f, 20f)
-                                        zoom = newZoom
-                                        val maxScroll = ((baseWidthPx * newZoom) - baseWidthPx).coerceAtLeast(0f).roundToInt()
-                                        val rawScroll = (scrollState.value + centroid.x) * (newZoom / oldZoom) - centroid.x
-                                        scope.launch { scrollState.scrollTo(rawScroll.roundToInt().coerceIn(0, maxScroll)) }
-                                    }
-                                    prevSpan = span
-                                    event.changes.forEach { it.consume() }
-                                } else {
-                                    if (prevSpan > 0f) prevSpan = 0f
-                                    val movement = (first.position - downPos).getDistance()
-                                    maxMovement = maxOf(maxMovement, movement)
-                                }
+                        detectTapGestures { tapOffset ->
+                            val contentX = scrollState.value.toFloat() + tapOffset.x
+                            val contentW = baseWidthPx * zoom
+                            val threshold = tapThresholdPx * zoom
+                            var bestIdx = -1
+                            var bestDist = Float.MAX_VALUE
+                            frameTimestampsMs.forEachIndexed { i, tsMs ->
+                                val tickX = (tsMs.toFloat() / videoDurationMs) * contentW
+                                val d = abs(contentX - tickX)
+                                if (d < bestDist) { bestDist = d; bestIdx = i }
                             }
-                            if (isTapCandidate && maxMovement < viewConfiguration.touchSlop * 2) {
-                                val contentX = scrollState.value.toFloat() + downPos.x
-                                val contentW = baseWidthPx * zoom
-                                val threshold = tapThresholdPx * zoom
-                                var bestIdx = -1
-                                var bestDist = Float.MAX_VALUE
-                                frameTimestampsMs.forEachIndexed { i, tsMs ->
-                                    val tickX = (tsMs.toFloat() / videoDurationMs) * contentW
-                                    val d = abs(contentX - tickX)
-                                    if (d < bestDist) { bestDist = d; bestIdx = i }
+                            if (bestIdx >= 0 && bestDist < threshold) onTickTapped(bestIdx)
+                        }
+                    }
+                    // Pinch-zoom handler: anchored around the pinch centroid.
+                    .pointerInput(Unit) {
+                        detectTransformGestures { centroid, _, zoomDelta, _ ->
+                            val oldZoom = zoom
+                            val newZoom = (oldZoom * zoomDelta).coerceIn(1f, 20f)
+                            if (newZoom != oldZoom) {
+                                zoom = newZoom
+                                val maxScroll = ((baseWidthPx * newZoom) - baseWidthPx)
+                                    .coerceAtLeast(0f).roundToInt()
+                                val rawScroll =
+                                    (scrollState.value + centroid.x) * (newZoom / oldZoom) - centroid.x
+                                scope.launch {
+                                    scrollState.scrollTo(rawScroll.roundToInt().coerceIn(0, maxScroll))
                                 }
-                                if (bestIdx >= 0 && bestDist < threshold) onTickTapped(bestIdx)
                             }
                         }
                     }
