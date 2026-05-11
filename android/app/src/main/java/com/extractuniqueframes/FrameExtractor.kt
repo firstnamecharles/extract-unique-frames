@@ -8,6 +8,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.withContext
@@ -96,7 +97,7 @@ class FrameExtractor(private val context: Context) {
         var currBitmap: Bitmap? = null
         var timeUs = 0L
 
-        while (isActive) {
+        while (currentCoroutineContext().isActive) {
             val nextBitmap: Bitmap? = if (timeUs <= durationUs)
                 retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
             else null
@@ -204,7 +205,7 @@ class FrameExtractor(private val context: Context) {
         var frameIndex = 0
         var timeUs = 0L
 
-        while (isActive) {
+        while (currentCoroutineContext().isActive) {
             val nextBitmap: Bitmap? = if (timeUs <= durationUs)
                 retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
             else null
