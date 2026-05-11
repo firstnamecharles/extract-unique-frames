@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Film frame outline -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M34,30 h40 a4,4 0 0 1 4,4 v40 a4,4 0 0 1 -4,4 H34 a4,4 0 0 1 -4,-4 V34 a4,4 0 0 1 4,-4 Z
+                          M34,34 v40 h40 V34 Z
+                          M36,34 h4 v6 h-4 Z M48,34 h4 v6 h-4 Z M60,34 h4 v6 h-4 Z M68,34 h4 v6 h-4 Z
+                          M36,68 h4 v6 h-4 Z M48,68 h4 v6 h-4 Z M60,68 h4 v6 h-4 Z M68,68 h4 v6 h-4 Z" />
+    <!-- Play triangle -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M46,44 L46,64 L64,54 Z" />
+</vector>
