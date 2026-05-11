@@ -1,7 +1,10 @@
 package com.extractuniqueframes
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -10,12 +13,16 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.expandVertically
 import androidx.compose.animation.shrinkVertically
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
-import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.grid.itemsIndexed
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -26,20 +33,25 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
-import androidx.core.content.FileProvider
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import coil.compose.AsyncImage
 import com.extractuniqueframes.ui.theme.ExtractUniqueFramesTheme
-import java.io.File
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlin.math.abs
 import kotlin.math.roundToInt
 
 class MainActivity : ComponentActivity() {
@@ -86,6 +98,7 @@ fun ExtractUniqueFramesApp(vm: ExtractViewModel = viewModel()) {
 
 @Composable
 fun HomeScreen(onStartExtraction: (Uri, FrameExtractor.Config) -> Unit) {
+    val context = LocalContext.current
     var selectedUri by remember { mutableStateOf<Uri?>(null) }
     var settingsExpanded by remember { mutableStateOf(false) }
 
@@ -94,9 +107,40 @@ fun HomeScreen(onStartExtraction: (Uri, FrameExtractor.Config) -> Unit) {
     var frameIntervalMs by remember { mutableFloatStateOf(200f) }
     var filterTouchEffects by remember { mutableStateOf(true) }
 
+    // Held while we wait for WRITE_EXTERNAL_STORAGE on API ≤ 28
+    var pendingUri by remember { mutableStateOf<Uri?>(null) }
+    var pendingConfig by remember { mutableStateOf<FrameExtractor.Config?>(null) }
+
+    val writePermLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted) {
+            val uri = pendingUri
+            val config = pendingConfig
+            if (uri != null && config != null) {
+                onStartExtraction(uri, config)
+                pendingUri = null
+                pendingConfig = null
+            }
+        }
+    }
+
     val picker = rememberLauncherForActivityResult(
         ActivityResultContracts.GetContent()
     ) { uri -> selectedUri = uri }
+
+    fun launchExtraction(uri: Uri, config: FrameExtractor.Config) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                != PackageManager.PERMISSION_GRANTED
+        ) {
+            pendingUri = uri
+            pendingConfig = config
+            writePermLauncher.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+        } else {
+            onStartExtraction(uri, config)
+        }
+    }
 
     Column(
         modifier = Modifier
@@ -241,7 +285,7 @@ fun HomeScreen(onStartExtraction: (Uri, FrameExtractor.Config) -> Unit) {
         Button(
             onClick = {
                 selectedUri?.let { uri ->
-                    onStartExtraction(
+                    launchExtraction(
                         uri,
                         FrameExtractor.Config(
                             pHashThreshold = pHashThreshold.roundToInt(),
@@ -312,7 +356,7 @@ fun ProcessingScreen(progress: Float, framesFound: Int, onCancel: () -> Unit) {
         )
         Spacer(Modifier.height(8.dp))
         Text(
-            "${(progress * 100).roundToInt()}%",
+            "Processing: ${(progress * 100).roundToInt()}%",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
@@ -336,7 +380,10 @@ fun ProcessingScreen(progress: Float, framesFound: Int, onCancel: () -> Unit) {
 @Composable
 fun ResultsScreen(result: FrameExtractor.Result, onStartOver: () -> Unit) {
     val context = LocalContext.current
-    var selectedFrame by remember { mutableStateOf<File?>(null) }
+    var selectedFrameIndex by remember { mutableStateOf<Int?>(null) }
+    val gridState = rememberLazyGridState()
+    val scope = rememberCoroutineScope()
+    var highlightedIndex by remember { mutableStateOf<Int?>(null) }
 
     Column(modifier = Modifier.fillMaxSize()) {
         // Top bar
@@ -359,16 +406,12 @@ fun ResultsScreen(result: FrameExtractor.Result, onStartOver: () -> Unit) {
             IconButton(
                 onClick = {
                     if (result.savedFrames.isNotEmpty()) {
-                        val uris = result.savedFrames.map { file ->
-                            FileProvider.getUriForFile(
-                                context,
-                                "${context.packageName}.fileprovider",
-                                file
-                            )
-                        }
                         val intent = Intent(Intent.ACTION_SEND_MULTIPLE).apply {
                             type = "image/jpeg"
-                            putParcelableArrayListExtra(Intent.EXTRA_STREAM, ArrayList(uris))
+                            putParcelableArrayListExtra(
+                                Intent.EXTRA_STREAM,
+                                ArrayList(result.savedFrames)
+                            )
                             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                         }
                         context.startActivity(Intent.createChooser(intent, "Share frames"))
@@ -392,6 +435,52 @@ fun ResultsScreen(result: FrameExtractor.Result, onStartOver: () -> Unit) {
             StatChip("Touch", result.skippedTouchEffects, Modifier.weight(1f))
         }
 
+        // "Saved to" info + Open in Gallery
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                modifier = Modifier.weight(1f)
+            ) {
+                Icon(
+                    Icons.Default.FolderOpen,
+                    contentDescription = null,
+                    modifier = Modifier.size(15.dp),
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Text(
+                    "Saved to: ${FrameExtractor.SAVE_FOLDER}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            TextButton(
+                onClick = {
+                    result.savedFrames.lastOrNull()?.let { lastUri ->
+                        val intent = Intent(Intent.ACTION_VIEW, lastUri).apply {
+                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        }
+                        context.startActivity(intent)
+                    }
+                },
+                enabled = result.savedFrames.isNotEmpty()
+            ) {
+                Icon(
+                    Icons.Default.PhotoLibrary,
+                    contentDescription = null,
+                    modifier = Modifier.size(15.dp)
+                )
+                Spacer(Modifier.width(4.dp))
+                Text("Open in Gallery", style = MaterialTheme.typography.labelSmall)
+            }
+        }
+
         if (result.savedFrames.isEmpty()) {
             Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -410,55 +499,103 @@ fun ResultsScreen(result: FrameExtractor.Result, onStartOver: () -> Unit) {
                 }
             }
         } else {
+            // Timeline
+            FrameTimeline(
+                frameTimestampsMs = result.frameTimestampsMs,
+                videoDurationMs = result.videoDurationMs,
+                highlightIndex = highlightedIndex,
+                onTickTapped = { idx ->
+                    highlightedIndex = idx
+                    scope.launch {
+                        gridState.animateScrollToItem(idx)
+                        delay(1_500)
+                        highlightedIndex = null
+                    }
+                },
+                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+            )
+            HorizontalDivider()
+
+            // Frame grid
             LazyVerticalGrid(
                 columns = GridCells.Fixed(3),
+                state = gridState,
                 contentPadding = PaddingValues(4.dp),
                 verticalArrangement = Arrangement.spacedBy(4.dp),
                 horizontalArrangement = Arrangement.spacedBy(4.dp),
                 modifier = Modifier.fillMaxSize()
             ) {
-                items(result.savedFrames) { file ->
-                    AsyncImage(
-                        model = file,
-                        contentDescription = file.name,
-                        contentScale = ContentScale.Crop,
+                itemsIndexed(result.savedFrames) { idx, uri ->
+                    val isHighlighted = idx == highlightedIndex
+                    Box(
                         modifier = Modifier
                             .aspectRatio(1f)
                             .clip(RoundedCornerShape(4.dp))
-                            .clickable { selectedFrame = file }
-                    )
+                            .then(
+                                if (isHighlighted) Modifier.border(
+                                    2.dp,
+                                    MaterialTheme.colorScheme.primary,
+                                    RoundedCornerShape(4.dp)
+                                ) else Modifier
+                            )
+                            .clickable { selectedFrameIndex = idx }
+                    ) {
+                        AsyncImage(
+                            model = uri,
+                            contentDescription = null,
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier.fillMaxSize()
+                        )
+                        // mm:ss timestamp badge
+                        Text(
+                            text = formatTimestamp(result.frameTimestampsMs[idx]),
+                            modifier = Modifier
+                                .align(Alignment.BottomStart)
+                                .background(Color.Black.copy(alpha = 0.55f))
+                                .padding(horizontal = 3.dp, vertical = 1.dp),
+                            color = Color.White,
+                            style = MaterialTheme.typography.labelSmall
+                        )
+                    }
                 }
             }
         }
     }
 
     // Full-screen detail dialog
-    selectedFrame?.let { file ->
+    selectedFrameIndex?.let { idx ->
+        val uri = result.savedFrames[idx]
         Dialog(
-            onDismissRequest = { selectedFrame = null },
+            onDismissRequest = { selectedFrameIndex = null },
             properties = DialogProperties(usePlatformDefaultWidth = false)
         ) {
             Box(
                 modifier = Modifier
                     .fillMaxSize()
                     .background(Color.Black)
-                    .clickable { selectedFrame = null },
+                    .clickable { selectedFrameIndex = null },
                 contentAlignment = Alignment.Center
             ) {
                 AsyncImage(
-                    model = file,
+                    model = uri,
                     contentDescription = null,
                     contentScale = ContentScale.Fit,
                     modifier = Modifier.fillMaxSize()
                 )
-                // Share single frame button
+                // Timestamp badge in corner
+                Text(
+                    text = formatTimestamp(result.frameTimestampsMs[idx]),
+                    modifier = Modifier
+                        .align(Alignment.TopStart)
+                        .padding(12.dp)
+                        .background(Color.Black.copy(alpha = 0.6f), RoundedCornerShape(4.dp))
+                        .padding(horizontal = 8.dp, vertical = 4.dp),
+                    color = Color.White,
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.SemiBold
+                )
                 FloatingActionButton(
                     onClick = {
-                        val uri = FileProvider.getUriForFile(
-                            context,
-                            "${context.packageName}.fileprovider",
-                            file
-                        )
                         val intent = Intent(Intent.ACTION_SEND).apply {
                             type = "image/jpeg"
                             putExtra(Intent.EXTRA_STREAM, uri)
@@ -475,6 +612,76 @@ fun ResultsScreen(result: FrameExtractor.Result, onStartOver: () -> Unit) {
             }
         }
     }
+}
+
+// ─── Timeline ────────────────────────────────────────────────────────────────
+
+@Composable
+private fun FrameTimeline(
+    frameTimestampsMs: List<Long>,
+    videoDurationMs: Long,
+    highlightIndex: Int?,
+    onTickTapped: (Int) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    if (frameTimestampsMs.isEmpty() || videoDurationMs == 0L) return
+
+    val primary = MaterialTheme.colorScheme.primary
+    val outline = MaterialTheme.colorScheme.outline
+    val density = LocalDensity.current
+    val tapThresholdPx = with(density) { 24.dp.toPx() }
+
+    Canvas(
+        modifier = modifier
+            .fillMaxWidth()
+            .height(48.dp)
+            .pointerInput(frameTimestampsMs, videoDurationMs) {
+                detectTapGestures { tapOffset ->
+                    val w = size.width.toFloat()
+                    var bestIdx = -1
+                    var bestDist = Float.MAX_VALUE
+                    frameTimestampsMs.forEachIndexed { i, tsMs ->
+                        val tickX = (tsMs.toFloat() / videoDurationMs) * w
+                        val dist = abs(tapOffset.x - tickX)
+                        if (dist < bestDist) {
+                            bestDist = dist
+                            bestIdx = i
+                        }
+                    }
+                    if (bestIdx >= 0 && bestDist < tapThresholdPx) onTickTapped(bestIdx)
+                }
+            }
+    ) {
+        val cy = size.height / 2f
+
+        // Base line
+        drawLine(
+            color = outline.copy(alpha = 0.35f),
+            start = Offset(0f, cy),
+            end = Offset(size.width, cy),
+            strokeWidth = 2.dp.toPx()
+        )
+
+        // Tick marks
+        frameTimestampsMs.forEachIndexed { i, tsMs ->
+            val x = (tsMs.toFloat() / videoDurationMs) * size.width
+            val isHl = i == highlightIndex
+            val halfH = if (isHl) 16.dp.toPx() else 10.dp.toPx()
+            drawLine(
+                color = if (isHl) primary else primary.copy(alpha = 0.65f),
+                start = Offset(x, cy - halfH),
+                end = Offset(x, cy + halfH),
+                strokeWidth = if (isHl) 3.dp.toPx() else 1.5.dp.toPx()
+            )
+        }
+    }
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+private fun formatTimestamp(ms: Long): String {
+    val s = ms / 1000
+    return "%d:%02d".format(s / 60, s % 60)
 }
 
 @Composable

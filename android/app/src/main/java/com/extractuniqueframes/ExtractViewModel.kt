@@ -9,7 +9,6 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
-import java.io.File
 
 class ExtractViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -31,13 +30,8 @@ class ExtractViewModel(application: Application) : AndroidViewModel(application)
         job = viewModelScope.launch {
             _state.value = UiState.Processing(0f, 0)
             try {
-                val outputDir = File(
-                    getApplication<Application>().getExternalFilesDir(null),
-                    "frames/${System.currentTimeMillis()}"
-                )
                 val result = extractor.extract(
                     videoUri = videoUri,
-                    outputDir = outputDir,
                     config = config,
                     onProgress = { progress, framesFound ->
                         _state.value = UiState.Processing(progress, framesFound)
