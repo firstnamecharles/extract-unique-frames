@@ -17,7 +17,10 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
@@ -688,53 +691,108 @@ private fun FrameTimeline(
 ) {
     if (frameTimestampsMs.isEmpty() || videoDurationMs == 0L) return
 
+    var zoom by remember { mutableFloatStateOf(1f) }
+    val scrollState = rememberScrollState()
+    val scope = rememberCoroutineScope()
     val primary = MaterialTheme.colorScheme.primary
     val outline = MaterialTheme.colorScheme.outline
     val density = LocalDensity.current
-    val tapThresholdPx = with(density) { 24.dp.toPx() }
 
-    Canvas(
-        modifier = modifier
-            .fillMaxWidth()
-            .height(48.dp)
-            .pointerInput(frameTimestampsMs, videoDurationMs) {
-                detectTapGestures { tapOffset ->
-                    val w = size.width.toFloat()
-                    var bestIdx = -1
-                    var bestDist = Float.MAX_VALUE
-                    frameTimestampsMs.forEachIndexed { i, tsMs ->
-                        val tickX = (tsMs.toFloat() / videoDurationMs) * w
-                        val dist = abs(tapOffset.x - tickX)
-                        if (dist < bestDist) {
-                            bestDist = dist
-                            bestIdx = i
+    Row(modifier = modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        BoxWithConstraints(modifier = Modifier.weight(1f).height(48.dp)) {
+            val baseWidthPx = with(density) { maxWidth.toPx() }
+            Row(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .horizontalScroll(scrollState, enabled = false)
+                    .pointerInput(frameTimestampsMs, videoDurationMs) {
+                        val tapThresholdPx = with(density) { 24.dp.toPx() }
+                        awaitEachGesture {
+                            val firstDown = awaitFirstDown(requireUnconsumed = false)
+                            val downPos = firstDown.position
+                            var prevSpan = 0f
+                            var isTapCandidate = true
+                            var maxMovement = 0f
+                            gesture@ while (true) {
+                                val event = awaitPointerEvent(PointerEventPass.Initial)
+                                val pressed = event.changes.filter { it.pressed }
+                                if (pressed.isEmpty()) break@gesture
+                                val first = pressed.firstOrNull { it.id == firstDown.id }
+                                val second = pressed.firstOrNull { it.id != firstDown.id }
+                                if (first == null) {
+                                    event.changes.forEach { it.consume() }
+                                    break@gesture
+                                }
+                                if (second != null) {
+                                    isTapCandidate = false
+                                    val span = (first.position - second.position).getDistance()
+                                    val centroid = (first.position + second.position) / 2f
+                                    if (prevSpan > 0f && span > 0f) {
+                                        val oldZoom = zoom
+                                        val newZoom = (zoom * span / prevSpan).coerceIn(1f, 20f)
+                                        zoom = newZoom
+                                        val maxScroll = ((baseWidthPx * newZoom) - baseWidthPx).coerceAtLeast(0f).roundToInt()
+                                        val rawScroll = (scrollState.value + centroid.x) * (newZoom / oldZoom) - centroid.x
+                                        scope.launch { scrollState.scrollTo(rawScroll.roundToInt().coerceIn(0, maxScroll)) }
+                                    }
+                                    prevSpan = span
+                                    event.changes.forEach { it.consume() }
+                                } else {
+                                    if (prevSpan > 0f) prevSpan = 0f
+                                    val movement = (first.position - downPos).getDistance()
+                                    maxMovement = maxOf(maxMovement, movement)
+                                }
+                            }
+                            if (isTapCandidate && maxMovement < viewConfiguration.touchSlop * 2) {
+                                val contentX = scrollState.value.toFloat() + downPos.x
+                                val contentW = baseWidthPx * zoom
+                                val threshold = tapThresholdPx * zoom
+                                var bestIdx = -1
+                                var bestDist = Float.MAX_VALUE
+                                frameTimestampsMs.forEachIndexed { i, tsMs ->
+                                    val tickX = (tsMs.toFloat() / videoDurationMs) * contentW
+                                    val d = abs(contentX - tickX)
+                                    if (d < bestDist) { bestDist = d; bestIdx = i }
+                                }
+                                if (bestIdx >= 0 && bestDist < threshold) onTickTapped(bestIdx)
+                            }
                         }
                     }
-                    if (bestIdx >= 0 && bestDist < tapThresholdPx) onTickTapped(bestIdx)
+            ) {
+                Canvas(modifier = Modifier.width(maxWidth * zoom).fillMaxHeight()) {
+                    val cy = size.height / 2f
+                    drawLine(
+                        color = outline.copy(alpha = 0.35f),
+                        start = Offset(0f, cy),
+                        end = Offset(size.width, cy),
+                        strokeWidth = 2.dp.toPx()
+                    )
+                    frameTimestampsMs.forEachIndexed { i, tsMs ->
+                        val x = (tsMs.toFloat() / videoDurationMs) * size.width
+                        val isHl = i == highlightIndex
+                        val halfH = if (isHl) 16.dp.toPx() else 10.dp.toPx()
+                        drawLine(
+                            color = if (isHl) primary else primary.copy(alpha = 0.65f),
+                            start = Offset(x, cy - halfH),
+                            end = Offset(x, cy + halfH),
+                            strokeWidth = if (isHl) 3.dp.toPx() else 1.5.dp.toPx()
+                        )
+                    }
                 }
             }
-    ) {
-        val cy = size.height / 2f
-
-        // Base line
-        drawLine(
-            color = outline.copy(alpha = 0.35f),
-            start = Offset(0f, cy),
-            end = Offset(size.width, cy),
-            strokeWidth = 2.dp.toPx()
-        )
-
-        // Tick marks
-        frameTimestampsMs.forEachIndexed { i, tsMs ->
-            val x = (tsMs.toFloat() / videoDurationMs) * size.width
-            val isHl = i == highlightIndex
-            val halfH = if (isHl) 16.dp.toPx() else 10.dp.toPx()
-            drawLine(
-                color = if (isHl) primary else primary.copy(alpha = 0.65f),
-                start = Offset(x, cy - halfH),
-                end = Offset(x, cy + halfH),
-                strokeWidth = if (isHl) 3.dp.toPx() else 1.5.dp.toPx()
-            )
+        }
+        AnimatedVisibility(visible = zoom > 1f) {
+            IconButton(
+                onClick = { zoom = 1f; scope.launch { scrollState.scrollTo(0) } },
+                modifier = Modifier.size(40.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.ZoomOut,
+                    contentDescription = "Reset zoom",
+                    modifier = Modifier.size(20.dp),
+                    tint = MaterialTheme.colorScheme.primary
+                )
+            }
         }
     }
 }
