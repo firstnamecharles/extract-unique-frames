@@ -56,6 +56,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.media3.common.MediaItem
+import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import coil.compose.AsyncImage
@@ -263,6 +264,7 @@ fun HomeScreen(
 
 // ─── Player ──────────────────────────────────────────────────────────────────
 
+@OptIn(UnstableApi::class)
 @Composable
 fun PlayerScreen(
     videoUri: Uri,
