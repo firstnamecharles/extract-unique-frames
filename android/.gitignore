@@ -7,3 +7,7 @@
 /captures
 .externalNativeBuild
 .cxx
+# Exclude release keystores but NOT debug.keystore (intentionally committed)
+*.jks
+*.keystore
+!app/debug.keystore

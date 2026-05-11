@@ -8,3 +8,7 @@
 .externalNativeBuild
 .cxx
 local.properties
+# Exclude release keystores but NOT debug.keystore (intentionally committed)
+*.jks
+*.keystore
+!android/app/debug.keystore
