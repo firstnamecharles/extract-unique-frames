@@ -3,6 +3,9 @@ package com.extractuniqueframes
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.MediaExtractor
+import android.media.MediaFormat
+import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -11,14 +14,12 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.animation.expandVertically
-import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectTapGestures
-import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.grid.GridCells
@@ -37,6 +38,10 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
+import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -44,15 +49,21 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.media3.common.MediaItem
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.ui.PlayerView
 import coil.compose.AsyncImage
 import com.extractuniqueframes.ui.theme.ExtractUniqueFramesTheme
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
@@ -75,18 +86,18 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun ExtractUniqueFramesApp(vm: ExtractViewModel = viewModel()) {
     val state by vm.state.collectAsStateWithLifecycle()
-    val selectedMode by vm.mode.collectAsStateWithLifecycle()
 
     when (val s = state) {
         is ExtractViewModel.UiState.Idle -> HomeScreen(
-            selectedMode = selectedMode,
-            onModeChange = vm::setMode,
-            onStartExtraction = { uri, config -> vm.startExtraction(uri, config) }
+            onStartCapturing = { uri, durationMs -> vm.startCapturing(uri, durationMs) }
         )
-        is ExtractViewModel.UiState.Processing -> ProcessingScreen(
-            progress = s.progress,
-            framesFound = s.framesFound,
-            onCancel = { vm.cancel() }
+        is ExtractViewModel.UiState.Capturing -> PlayerScreen(
+            videoUri = s.videoUri,
+            videoDurationMs = s.videoDurationMs,
+            capturedUris = s.capturedUris,
+            capturedTimestampsMs = s.capturedTimestampsMs,
+            onCaptureFrame = { positionMs -> vm.captureFrame(positionMs) },
+            onDone = { vm.finish() }
         )
         is ExtractViewModel.UiState.Done -> ResultsScreen(
             result = s.result,
@@ -101,37 +112,24 @@ fun ExtractUniqueFramesApp(vm: ExtractViewModel = viewModel()) {
 
 // ─── Home ────────────────────────────────────────────────────────────────────
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun HomeScreen(
-    selectedMode: FrameExtractor.Mode,
-    onModeChange: (FrameExtractor.Mode) -> Unit,
-    onStartExtraction: (Uri, FrameExtractor.Config) -> Unit
+    onStartCapturing: (Uri, Long) -> Unit
 ) {
     val context = LocalContext.current
     var selectedUri by remember { mutableStateOf<Uri?>(null) }
-    var settingsExpanded by remember { mutableStateOf(false) }
+    var videoDurationMs by remember { mutableLongStateOf(0L) }
 
-    var pHashThreshold by remember { mutableFloatStateOf(10f) }
-    var colorDistance by remember { mutableFloatStateOf(20f) }
-    var frameIntervalMs by remember { mutableFloatStateOf(200f) }
-    var filterTouchEffects by remember { mutableStateOf(true) }
-    var stabilityRunLength by remember { mutableFloatStateOf(5f) }
-
-    // Held while we wait for WRITE_EXTERNAL_STORAGE on API ≤ 28
     var pendingUri by remember { mutableStateOf<Uri?>(null) }
-    var pendingConfig by remember { mutableStateOf<FrameExtractor.Config?>(null) }
 
     val writePermLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted ->
         if (granted) {
             val uri = pendingUri
-            val config = pendingConfig
-            if (uri != null && config != null) {
-                onStartExtraction(uri, config)
+            if (uri != null && videoDurationMs > 0L) {
+                onStartCapturing(uri, videoDurationMs)
                 pendingUri = null
-                pendingConfig = null
             }
         }
     }
@@ -140,16 +138,32 @@ fun HomeScreen(
         ActivityResultContracts.GetContent()
     ) { uri -> selectedUri = uri }
 
-    fun launchExtraction(uri: Uri, config: FrameExtractor.Config) {
+    // Read duration when URI changes
+    LaunchedEffect(selectedUri) {
+        val uri = selectedUri ?: return@LaunchedEffect
+        videoDurationMs = withContext(Dispatchers.IO) {
+            val retriever = MediaMetadataRetriever()
+            try {
+                retriever.setDataSource(context, uri)
+                retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
+                    ?.toLongOrNull() ?: 0L
+            } catch (_: Exception) {
+                0L
+            } finally {
+                retriever.release()
+            }
+        }
+    }
+
+    fun launchCapturing(uri: Uri) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q &&
             ContextCompat.checkSelfPermission(context, Manifest.permission.WRITE_EXTERNAL_STORAGE)
                 != PackageManager.PERMISSION_GRANTED
         ) {
             pendingUri = uri
-            pendingConfig = config
             writePermLauncher.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
         } else {
-            onStartExtraction(uri, config)
+            onStartCapturing(uri, videoDurationMs)
         }
     }
 
@@ -171,15 +185,14 @@ fun HomeScreen(
         )
 
         Text(
-            text = "Extract Unique Frames",
+            text = "Frame Capture",
             style = MaterialTheme.typography.headlineMedium,
             fontWeight = FontWeight.Bold,
             textAlign = TextAlign.Center
         )
 
         Text(
-            text = "Pick an MP4 screen recording and extract visually distinct frames, " +
-                   "filtered for touch-effect overlays.",
+            text = "Pick a video, scrub through it, and tap to capture the frames you want.",
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             textAlign = TextAlign.Center
@@ -191,7 +204,7 @@ fun HomeScreen(
         Card(
             modifier = Modifier
                 .fillMaxWidth()
-                .clickable { picker.launch("video/mp4") },
+                .clickable { picker.launch("video/*") },
             colors = CardDefaults.cardColors(
                 containerColor = if (selectedUri != null)
                     MaterialTheme.colorScheme.primaryContainer
@@ -212,131 +225,20 @@ fun HomeScreen(
                     else
                         MaterialTheme.colorScheme.onSurfaceVariant
                 )
-                Text(
-                    text = if (selectedUri != null)
-                        selectedUri!!.lastPathSegment ?: "Video selected"
-                    else
-                        "Tap to pick an MP4 file",
-                    style = MaterialTheme.typography.bodyMedium,
-                    modifier = Modifier.weight(1f)
-                )
-            }
-        }
-
-        // Settings accordion
-        Card(modifier = Modifier.fillMaxWidth()) {
-            Column {
-                ListItem(
-                    headlineContent = { Text("Settings") },
-                    trailingContent = {
-                        Icon(
-                            imageVector = if (settingsExpanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
-                            contentDescription = if (settingsExpanded) "Collapse" else "Expand"
-                        )
-                    },
-                    modifier = Modifier.clickable { settingsExpanded = !settingsExpanded }
-                )
-                AnimatedVisibility(
-                    visible = settingsExpanded,
-                    enter = expandVertically(),
-                    exit = shrinkVertically()
-                ) {
-                    Column(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
-
-                        // Mode selector
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = if (selectedUri != null)
+                            selectedUri!!.lastPathSegment ?: "Video selected"
+                        else
+                            "Tap to pick a video file",
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                    if (selectedUri != null && videoDurationMs > 0L) {
                         Text(
-                            "Extraction mode",
-                            style = MaterialTheme.typography.bodyMedium,
-                            modifier = Modifier.padding(bottom = 6.dp)
+                            text = "Duration: ${formatTimestamp(videoDurationMs)}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
-                        SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
-                            SegmentedButton(
-                                selected = selectedMode == FrameExtractor.Mode.INTERVAL,
-                                onClick = { onModeChange(FrameExtractor.Mode.INTERVAL) },
-                                shape = SegmentedButtonDefaults.itemShape(index = 0, count = 2),
-                                label = { Text("Interval") }
-                            )
-                            SegmentedButton(
-                                selected = selectedMode == FrameExtractor.Mode.SCENE_BASED,
-                                onClick = { onModeChange(FrameExtractor.Mode.SCENE_BASED) },
-                                shape = SegmentedButtonDefaults.itemShape(index = 1, count = 2),
-                                label = { Text("Scene-based") }
-                            )
-                        }
-
-                        Spacer(Modifier.height(4.dp))
-
-                        // pHash + colour thresholds — visible in both modes
-                        val thresholdDescription = if (selectedMode == FrameExtractor.Mode.INTERVAL)
-                            "Hamming distance; lower = stricter dedup"
-                        else
-                            "Transition sensitivity; lower = detects smaller changes"
-                        SliderSetting(
-                            label = "pHash threshold",
-                            value = pHashThreshold,
-                            onValueChange = { pHashThreshold = it },
-                            valueRange = 1f..25f,
-                            steps = 23,
-                            display = { it.roundToInt().toString() },
-                            description = thresholdDescription
-                        )
-                        val colourDescription = if (selectedMode == FrameExtractor.Mode.INTERVAL)
-                            "RGB Euclidean; lower = stricter dedup"
-                        else
-                            "Colour change sensitivity; lower = detects subtler shifts"
-                        SliderSetting(
-                            label = "Colour distance",
-                            value = colorDistance,
-                            onValueChange = { colorDistance = it },
-                            valueRange = 0f..100f,
-                            steps = 19,
-                            display = { it.roundToInt().toString() },
-                            description = colourDescription
-                        )
-
-                        // Interval-only setting
-                        if (selectedMode == FrameExtractor.Mode.INTERVAL) {
-                            SliderSetting(
-                                label = "Frame interval",
-                                value = frameIntervalMs,
-                                onValueChange = { frameIntervalMs = it },
-                                valueRange = 50f..2000f,
-                                steps = 38,
-                                display = { "${it.roundToInt()} ms" },
-                                description = "How often to sample the video"
-                            )
-                        }
-
-                        // Scene-based-only setting
-                        if (selectedMode == FrameExtractor.Mode.SCENE_BASED) {
-                            SliderSetting(
-                                label = "Frames unchanged before capture",
-                                value = stabilityRunLength,
-                                onValueChange = { stabilityRunLength = it },
-                                valueRange = 3f..20f,
-                                steps = 16,
-                                display = { it.roundToInt().toString() },
-                                description = "Consecutive stable frames required to save a key frame"
-                            )
-                        }
-
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(vertical = 8.dp),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Column(Modifier.weight(1f)) {
-                                Text("Filter touch effects", style = MaterialTheme.typography.bodyMedium)
-                                Text(
-                                    "Remove ripple / tap indicator frames",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            }
-                            Switch(checked = filterTouchEffects, onCheckedChange = { filterTouchEffects = it })
-                        }
                     }
                 }
             }
@@ -346,95 +248,482 @@ fun HomeScreen(
 
         Button(
             onClick = {
-                selectedUri?.let { uri ->
-                    launchExtraction(
-                        uri,
-                        FrameExtractor.Config(
-                            mode = selectedMode,
-                            pHashThreshold = pHashThreshold.roundToInt(),
-                            colorDistanceThreshold = colorDistance,
-                            frameIntervalMs = frameIntervalMs.roundToInt().toLong(),
-                            filterTouchEffects = filterTouchEffects,
-                            stabilityRunLength = stabilityRunLength.roundToInt()
-                        )
-                    )
-                }
+                selectedUri?.let { uri -> launchCapturing(uri) }
             },
-            enabled = selectedUri != null,
+            enabled = selectedUri != null && videoDurationMs > 0L,
             modifier = Modifier.fillMaxWidth(),
             contentPadding = PaddingValues(vertical = 14.dp)
         ) {
             Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(20.dp))
             Spacer(Modifier.width(8.dp))
-            Text("Extract Frames", style = MaterialTheme.typography.labelLarge)
+            Text("Start capturing", style = MaterialTheme.typography.labelLarge)
         }
     }
 }
 
+// ─── Player ──────────────────────────────────────────────────────────────────
+
 @Composable
-private fun SliderSetting(
-    label: String,
-    value: Float,
-    onValueChange: (Float) -> Unit,
-    valueRange: ClosedFloatingPointRange<Float>,
-    steps: Int,
-    display: (Float) -> String,
-    description: String
+fun PlayerScreen(
+    videoUri: Uri,
+    videoDurationMs: Long,
+    capturedUris: List<Uri>,
+    capturedTimestampsMs: List<Long>,
+    onCaptureFrame: (Long) -> Unit,
+    onDone: () -> Unit
 ) {
-    Column(Modifier.padding(vertical = 6.dp)) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+
+    // ExoPlayer setup
+    val exoPlayer = remember {
+        ExoPlayer.Builder(context).build().apply {
+            setMediaItem(MediaItem.fromUri(videoUri))
+            prepare()
+        }
+    }
+    DisposableEffect(exoPlayer) {
+        onDispose { exoPlayer.release() }
+    }
+
+    var positionMs by remember { mutableLongStateOf(0L) }
+    var isPlaying by remember { mutableStateOf(false) }
+    var frameDurationMs by remember { mutableLongStateOf(33L) } // default 30fps
+
+    // Position polling
+    LaunchedEffect(exoPlayer) {
+        while (true) {
+            positionMs = exoPlayer.currentPosition.coerceAtLeast(0L)
+            isPlaying = exoPlayer.isPlaying
+            delay(50)
+        }
+    }
+
+    // Frame rate reading
+    LaunchedEffect(videoUri) {
+        frameDurationMs = withContext(Dispatchers.IO) {
+            val extractor = MediaExtractor()
+            try {
+                extractor.setDataSource(context, videoUri, null)
+                var fps = 30
+                for (i in 0 until extractor.trackCount) {
+                    val format = extractor.getTrackFormat(i)
+                    val mime = format.getString(MediaFormat.KEY_MIME) ?: continue
+                    if (mime.startsWith("video/")) {
+                        fps = if (format.containsKey(MediaFormat.KEY_FRAME_RATE)) {
+                            format.getInteger(MediaFormat.KEY_FRAME_RATE).takeIf { it > 0 } ?: 30
+                        } else 30
+                        break
+                    }
+                }
+                (1000L / fps).coerceAtLeast(16L)
+            } catch (_: Exception) {
+                33L
+            } finally {
+                extractor.release()
+            }
+        }
+    }
+
+    // Capture flash
+    var flashKey by remember { mutableIntStateOf(0) }
+    var showFlash by remember { mutableStateOf(false) }
+    LaunchedEffect(flashKey) {
+        if (flashKey > 0) {
+            showFlash = true
+            delay(150)
+            showFlash = false
+        }
+    }
+
+    Column(modifier = Modifier.fillMaxSize().background(Color.Black)) {
+        // Top bar
         Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.9f))
+                .padding(horizontal = 8.dp, vertical = 4.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            Text(label, style = MaterialTheme.typography.bodyMedium)
+            // Captured count chip
+            Surface(
+                shape = RoundedCornerShape(16.dp),
+                color = MaterialTheme.colorScheme.secondaryContainer
+            ) {
+                Text(
+                    text = "${capturedUris.size} frames captured",
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSecondaryContainer
+                )
+            }
+
+            // Done button
+            IconButton(onClick = onDone) {
+                Icon(
+                    imageVector = Icons.Default.Check,
+                    contentDescription = "Done",
+                    tint = MaterialTheme.colorScheme.primary
+                )
+            }
+        }
+
+        // Video surface — tappable to capture
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(1f)
+                .clickable {
+                    val pos = positionMs
+                    onCaptureFrame(pos)
+                    flashKey++
+                }
+        ) {
+            AndroidView(
+                factory = { ctx ->
+                    PlayerView(ctx).apply {
+                        player = exoPlayer
+                        useController = false
+                    }
+                },
+                modifier = Modifier.fillMaxSize()
+            )
+
+            // Capture flash overlay
+            if (showFlash) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(Color.White.copy(alpha = 0.5f))
+                )
+            }
+        }
+
+        // Timeline
+        VideoTimeline(
+            durationMs = videoDurationMs,
+            positionMs = positionMs,
+            capturedTimestampsMs = capturedTimestampsMs,
+            onSeek = { seekMs ->
+                exoPlayer.seekTo(seekMs)
+                positionMs = seekMs
+            },
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(MaterialTheme.colorScheme.surface)
+                .padding(horizontal = 8.dp, vertical = 4.dp)
+        )
+
+        // Controls row
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(MaterialTheme.colorScheme.surface)
+                .padding(horizontal = 16.dp, vertical = 8.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            // Step back one frame
+            IconButton(onClick = {
+                val newPos = (positionMs - frameDurationMs).coerceAtLeast(0L)
+                exoPlayer.seekTo(newPos)
+                positionMs = newPos
+            }) {
+                Icon(Icons.Default.SkipPrevious, contentDescription = "Step back")
+            }
+
+            // Play/pause
+            IconButton(onClick = {
+                if (exoPlayer.isPlaying) exoPlayer.pause() else exoPlayer.play()
+            }) {
+                Icon(
+                    imageVector = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                    contentDescription = if (isPlaying) "Pause" else "Play"
+                )
+            }
+
+            // Step forward one frame
+            IconButton(onClick = {
+                val newPos = (positionMs + frameDurationMs).coerceAtMost(videoDurationMs)
+                exoPlayer.seekTo(newPos)
+                positionMs = newPos
+            }) {
+                Icon(Icons.Default.SkipNext, contentDescription = "Step forward")
+            }
+
+            // Time display
             Text(
-                display(value),
-                style = MaterialTheme.typography.bodyMedium,
-                fontWeight = FontWeight.SemiBold,
-                color = MaterialTheme.colorScheme.primary
+                text = "${formatTimestamp(positionMs)} / ${formatTimestamp(videoDurationMs)}",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
-        Slider(value = value, onValueChange = onValueChange, valueRange = valueRange, steps = steps)
-        Text(description, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+
+        // Capture button
+        Button(
+            onClick = {
+                val pos = positionMs
+                onCaptureFrame(pos)
+                flashKey++
+            },
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 8.dp),
+            contentPadding = PaddingValues(vertical = 12.dp)
+        ) {
+            Icon(Icons.Default.CameraAlt, contentDescription = null, modifier = Modifier.size(20.dp))
+            Spacer(Modifier.width(8.dp))
+            Text("Capture frame", style = MaterialTheme.typography.labelLarge)
+        }
     }
 }
 
-// ─── Processing ──────────────────────────────────────────────────────────────
+// ─── Video Timeline ───────────────────────────────────────────────────────────
 
 @Composable
-fun ProcessingScreen(progress: Float, framesFound: Int, onCancel: () -> Unit) {
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(32.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
-    ) {
-        CircularProgressIndicator(modifier = Modifier.size(72.dp), strokeWidth = 6.dp)
-        Spacer(Modifier.height(32.dp))
-        Text("Analysing video…", style = MaterialTheme.typography.titleLarge)
-        Spacer(Modifier.height(16.dp))
-        LinearProgressIndicator(
-            progress = { progress },
-            modifier = Modifier.fillMaxWidth()
-        )
-        Spacer(Modifier.height(8.dp))
-        Text(
-            "Processing: ${(progress * 100).roundToInt()}%",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant
-        )
-        Spacer(Modifier.height(24.dp))
-        Text(
-            "$framesFound unique frame${if (framesFound == 1) "" else "s"} found",
-            style = MaterialTheme.typography.bodyLarge,
-            fontWeight = FontWeight.Medium
-        )
-        Spacer(Modifier.height(32.dp))
-        OutlinedButton(onClick = onCancel) {
-            Icon(Icons.Default.Cancel, contentDescription = null, modifier = Modifier.size(18.dp))
-            Spacer(Modifier.width(6.dp))
-            Text("Cancel")
+fun VideoTimeline(
+    durationMs: Long,
+    positionMs: Long,
+    capturedTimestampsMs: List<Long>,
+    onSeek: (Long) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    if (durationMs <= 0L) return
+
+    var zoom by remember { mutableFloatStateOf(1f) }
+    val scrollState = rememberScrollState()
+    val scope = rememberCoroutineScope()
+    val density = LocalDensity.current
+    var isDragging by remember { mutableStateOf(false) }
+    var lastSeekMs by remember { mutableLongStateOf(0L) }
+
+    val colorSurfaceVariant = MaterialTheme.colorScheme.surfaceVariant
+    val colorPrimary = MaterialTheme.colorScheme.primary
+    val colorTertiary = MaterialTheme.colorScheme.tertiary
+    val colorOnSurface = MaterialTheme.colorScheme.onSurface
+
+    // Auto-scroll to keep playhead centred
+    LaunchedEffect(positionMs, zoom) {
+        if (zoom > 1f && !isDragging && durationMs > 0L) {
+            val baseWidthPx = with(density) {
+                // We'll compute after we know the actual size, so we approximate
+                // This will be updated in BoxWithConstraints
+            }
+        }
+    }
+
+    Column(modifier = modifier) {
+        BoxWithConstraints(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(72.dp)
+        ) {
+            val baseWidth = maxWidth
+            val baseWidthPx = with(density) { baseWidth.toPx() }
+
+            // Auto-scroll effect (needs baseWidthPx, placed inside BoxWithConstraints scope)
+            LaunchedEffect(positionMs, zoom) {
+                if (zoom > 1f && !isDragging && durationMs > 0L) {
+                    val contentWidthPx = baseWidthPx * zoom
+                    val playheadX = (positionMs.toFloat() / durationMs) * contentWidthPx
+                    val targetScroll = (playheadX - baseWidthPx / 2f)
+                        .roundToInt()
+                        .coerceIn(0, (contentWidthPx - baseWidthPx).coerceAtLeast(0f).roundToInt())
+                    scrollState.animateScrollTo(targetScroll)
+                }
+            }
+
+            Row(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .horizontalScroll(scrollState, enabled = false)
+                    .pointerInput(durationMs) {
+                        awaitEachGesture {
+                            val down = awaitFirstDown(requireUnconsumed = false)
+                            isDragging = true
+
+                            // Seek on initial down
+                            val contentX = scrollState.value.toFloat() + down.position.x
+                            val contentWidthPx = baseWidthPx * zoom
+                            val seekMs = ((contentX / contentWidthPx) * durationMs)
+                                .toLong()
+                                .coerceIn(0L, durationMs)
+                            val now = System.currentTimeMillis()
+                            if (now - lastSeekMs >= 100L) {
+                                onSeek(seekMs)
+                                lastSeekMs = now
+                            }
+
+                            var prevSpan = 0f
+                            var prevCentroidX = down.position.x
+
+                            try {
+                                while (true) {
+                                    val event = awaitPointerEvent()
+                                    val pointers = event.changes.filter { it.pressed }
+                                    if (pointers.isEmpty()) break
+
+                                    if (pointers.size == 1) {
+                                        // Single finger: seek
+                                        val finger = pointers[0]
+                                        val cx = scrollState.value.toFloat() + finger.position.x
+                                        val sm = ((cx / (baseWidthPx * zoom)) * durationMs)
+                                            .toLong()
+                                            .coerceIn(0L, durationMs)
+                                        val nowMs = System.currentTimeMillis()
+                                        if (nowMs - lastSeekMs >= 100L) {
+                                            onSeek(sm)
+                                            lastSeekMs = nowMs
+                                        }
+                                        prevCentroidX = finger.position.x
+                                        prevSpan = 0f
+                                    } else if (pointers.size >= 2) {
+                                        // Two fingers: pinch zoom
+                                        val p0 = pointers[0].position
+                                        val p1 = pointers[1].position
+                                        val span = abs(p1.x - p0.x)
+                                        val centroidX = (p0.x + p1.x) / 2f
+
+                                        if (prevSpan > 0f && span > 0f) {
+                                            val zoomDelta = span / prevSpan
+                                            val oldZoom = zoom
+                                            val newZoom = (oldZoom * zoomDelta).coerceIn(1f, 50f)
+                                            if (newZoom != oldZoom) {
+                                                zoom = newZoom
+                                                val maxScroll = ((baseWidthPx * newZoom) - baseWidthPx)
+                                                    .coerceAtLeast(0f).roundToInt()
+                                                val anchorInContent = scrollState.value + centroidX
+                                                val scaledAnchor = anchorInContent * (newZoom / oldZoom)
+                                                val newScroll = (scaledAnchor - centroidX)
+                                                    .roundToInt()
+                                                    .coerceIn(0, maxScroll)
+                                                scope.launch { scrollState.scrollTo(newScroll) }
+                                            }
+                                        }
+                                        prevSpan = span
+                                        prevCentroidX = centroidX
+                                    }
+                                }
+                            } finally {
+                                isDragging = false
+                            }
+                        }
+                    }
+            ) {
+                Canvas(
+                    modifier = Modifier
+                        .width(baseWidth * zoom)
+                        .height(72.dp)
+                ) {
+                    val w = size.width
+                    val h = size.height
+                    val barTop = h * 0.35f
+                    val barBot = h * 0.65f
+
+                    // Background bar
+                    drawRoundRect(
+                        color = colorSurfaceVariant,
+                        topLeft = Offset(0f, barTop),
+                        size = androidx.compose.ui.geometry.Size(w, barBot - barTop),
+                        cornerRadius = androidx.compose.ui.geometry.CornerRadius(4.dp.toPx())
+                    )
+
+                    // Determine label interval
+                    val intervals = longArrayOf(500, 1000, 5000, 10000, 30000, 60000, 300000)
+                    val labelPaint = android.graphics.Paint().apply {
+                        color = colorOnSurface.copy(alpha = 0.6f).toArgb()
+                        textSize = 9.dp.toPx()
+                        isAntiAlias = true
+                        textAlign = android.graphics.Paint.Align.CENTER
+                    }
+                    val labelWidthPx = labelPaint.measureText("00:00") + 6.dp.toPx()
+                    var chosenInterval = intervals.last()
+                    for (iv in intervals) {
+                        val gapPx = (iv.toFloat() / durationMs) * w
+                        if (gapPx >= labelWidthPx) {
+                            chosenInterval = iv
+                            break
+                        }
+                    }
+
+                    // Draw tick lines and labels
+                    var t = 0L
+                    while (t <= durationMs) {
+                        val x = (t.toFloat() / durationMs) * w
+                        drawLine(
+                            color = colorOnSurface.copy(alpha = 0.25f),
+                            start = Offset(x, barTop - 4.dp.toPx()),
+                            end = Offset(x, barBot + 4.dp.toPx()),
+                            strokeWidth = 1.dp.toPx()
+                        )
+                        drawIntoCanvas { canvas ->
+                            canvas.nativeCanvas.drawText(
+                                formatTimestamp(t),
+                                x,
+                                h * 0.95f,
+                                labelPaint
+                            )
+                        }
+                        t += chosenInterval
+                    }
+
+                    // Captured frame ticks
+                    capturedTimestampsMs.forEach { tsMs ->
+                        val x = (tsMs.toFloat() / durationMs) * w
+                        drawLine(
+                            color = colorTertiary,
+                            start = Offset(x, barTop - 8.dp.toPx()),
+                            end = Offset(x, barBot + 8.dp.toPx()),
+                            strokeWidth = 2.5.dp.toPx()
+                        )
+                    }
+
+                    // Playhead (only when positionMs >= 0)
+                    if (positionMs >= 0L) {
+                        val px = (positionMs.toFloat() / durationMs) * w
+                        drawLine(
+                            color = colorPrimary,
+                            start = Offset(px, 0f),
+                            end = Offset(px, h),
+                            strokeWidth = 2.dp.toPx()
+                        )
+                        // Diamond
+                        val diamondSize = 6.dp.toPx()
+                        val diamondPath = Path().apply {
+                            moveTo(px, barTop - diamondSize)
+                            lineTo(px + diamondSize / 2f, barTop)
+                            lineTo(px, barTop + diamondSize)
+                            lineTo(px - diamondSize / 2f, barTop)
+                            close()
+                        }
+                        drawPath(diamondPath, color = colorPrimary)
+                    }
+                }
+            }
+        }
+
+        // Reset zoom button
+        AnimatedVisibility(visible = zoom > 1f) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.End
+            ) {
+                TextButton(
+                    onClick = {
+                        zoom = 1f
+                        scope.launch { scrollState.scrollTo(0) }
+                    }
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.ZoomOut,
+                        contentDescription = "Reset zoom",
+                        modifier = Modifier.size(16.dp)
+                    )
+                    Spacer(Modifier.width(4.dp))
+                    Text("Reset zoom", style = MaterialTheme.typography.labelSmall)
+                }
+            }
         }
     }
 }
@@ -447,7 +736,6 @@ fun ResultsScreen(result: FrameExtractor.Result, onStartOver: () -> Unit) {
     var selectedFrameIndex by remember { mutableStateOf<Int?>(null) }
     val gridState = rememberLazyGridState()
     val scope = rememberCoroutineScope()
-    var highlightedIndex by remember { mutableStateOf<Int?>(null) }
 
     Column(modifier = Modifier.fillMaxSize()) {
         // Top bar
@@ -459,14 +747,21 @@ fun ResultsScreen(result: FrameExtractor.Result, onStartOver: () -> Unit) {
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            IconButton(onClick = onStartOver) {
+            // Start over
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.clickable { onStartOver() }
+            ) {
                 Icon(Icons.Default.ArrowBack, contentDescription = "Start over")
+                Spacer(Modifier.width(4.dp))
+                Text("Start over", style = MaterialTheme.typography.labelMedium)
             }
             Text(
-                "${result.savedFrames.size} unique frames",
+                "${result.savedFrames.size} frames captured",
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.Bold
             )
+            // Share all button
             IconButton(
                 onClick = {
                     if (result.savedFrames.isNotEmpty()) {
@@ -486,24 +781,11 @@ fun ResultsScreen(result: FrameExtractor.Result, onStartOver: () -> Unit) {
             }
         }
 
-        // Stats row
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 16.dp, vertical = 8.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            StatChip("Checked", result.totalChecked, Modifier.weight(1f))
-            StatChip("Saved", result.savedFrames.size, Modifier.weight(1f))
-            StatChip("Dupes", result.skippedDuplicates, Modifier.weight(1f))
-            StatChip("Touch", result.skippedTouchEffects, Modifier.weight(1f))
-        }
-
         // "Saved to" info + Open in Gallery
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 16.dp, vertical = 2.dp),
+                .padding(horizontal = 16.dp, vertical = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween
         ) {
@@ -556,24 +838,26 @@ fun ResultsScreen(result: FrameExtractor.Result, onStartOver: () -> Unit) {
                     )
                     Spacer(Modifier.height(12.dp))
                     Text(
-                        "No unique frames found",
+                        "No frames captured",
                         style = MaterialTheme.typography.bodyLarge,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
             }
         } else {
-            // Timeline
-            FrameTimeline(
-                frameTimestampsMs = result.frameTimestampsMs,
-                videoDurationMs = result.videoDurationMs,
-                highlightIndex = highlightedIndex,
-                onTickTapped = { idx ->
-                    highlightedIndex = idx
-                    scope.launch {
-                        gridState.animateScrollToItem(idx)
-                        delay(1_500)
-                        highlightedIndex = null
+            // Timeline (static, no playhead — positionMs = -1)
+            VideoTimeline(
+                durationMs = result.videoDurationMs,
+                positionMs = -1L,
+                capturedTimestampsMs = result.frameTimestampsMs,
+                onSeek = { seekMs ->
+                    // Find nearest captured frame and scroll to it
+                    if (result.frameTimestampsMs.isNotEmpty()) {
+                        val nearestIdx = result.frameTimestampsMs
+                            .indexOfMinBy { abs(it - seekMs) }
+                        if (nearestIdx >= 0) {
+                            scope.launch { gridState.animateScrollToItem(nearestIdx) }
+                        }
                     }
                 },
                 modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
@@ -590,18 +874,10 @@ fun ResultsScreen(result: FrameExtractor.Result, onStartOver: () -> Unit) {
                 modifier = Modifier.fillMaxSize()
             ) {
                 itemsIndexed(result.savedFrames) { idx, uri ->
-                    val isHighlighted = idx == highlightedIndex
                     Box(
                         modifier = Modifier
                             .aspectRatio(1f)
                             .clip(RoundedCornerShape(4.dp))
-                            .then(
-                                if (isHighlighted) Modifier.border(
-                                    2.dp,
-                                    MaterialTheme.colorScheme.primary,
-                                    RoundedCornerShape(4.dp)
-                                ) else Modifier
-                            )
                             .clickable { selectedFrameIndex = idx }
                     ) {
                         AsyncImage(
@@ -646,7 +922,7 @@ fun ResultsScreen(result: FrameExtractor.Result, onStartOver: () -> Unit) {
                     contentScale = ContentScale.Fit,
                     modifier = Modifier.fillMaxSize()
                 )
-                // Timestamp badge in corner
+                // Timestamp badge
                 Text(
                     text = formatTimestamp(result.frameTimestampsMs[idx]),
                     modifier = Modifier
@@ -674,137 +950,6 @@ fun ResultsScreen(result: FrameExtractor.Result, onStartOver: () -> Unit) {
                     Icon(Icons.Default.Share, contentDescription = "Share")
                 }
             }
-        }
-    }
-}
-
-// ─── Timeline ────────────────────────────────────────────────────────────────
-
-@Composable
-private fun FrameTimeline(
-    frameTimestampsMs: List<Long>,
-    videoDurationMs: Long,
-    highlightIndex: Int?,
-    onTickTapped: (Int) -> Unit,
-    modifier: Modifier = Modifier
-) {
-    if (frameTimestampsMs.isEmpty() || videoDurationMs == 0L) return
-
-    var zoom by remember { mutableFloatStateOf(1f) }
-    val scrollState = rememberScrollState()
-    val scope = rememberCoroutineScope()
-    val primary = MaterialTheme.colorScheme.primary
-    val outline = MaterialTheme.colorScheme.outline
-    val density = LocalDensity.current
-
-    Row(modifier = modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-        BoxWithConstraints(modifier = Modifier.weight(1f).height(48.dp)) {
-            val baseWidth = maxWidth
-            val baseWidthPx = with(density) { baseWidth.toPx() }
-            val tapThresholdPx = with(density) { 24.dp.toPx() }
-            Row(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .horizontalScroll(scrollState, enabled = false)
-                    // Tap handler: find nearest tick in content coordinates.
-                    .pointerInput(frameTimestampsMs, videoDurationMs) {
-                        detectTapGestures { tapOffset ->
-                            val contentX = scrollState.value.toFloat() + tapOffset.x
-                            val contentW = baseWidthPx * zoom
-                            val threshold = tapThresholdPx * zoom
-                            var bestIdx = -1
-                            var bestDist = Float.MAX_VALUE
-                            frameTimestampsMs.forEachIndexed { i, tsMs ->
-                                val tickX = (tsMs.toFloat() / videoDurationMs) * contentW
-                                val d = abs(contentX - tickX)
-                                if (d < bestDist) { bestDist = d; bestIdx = i }
-                            }
-                            if (bestIdx >= 0 && bestDist < threshold) onTickTapped(bestIdx)
-                        }
-                    }
-                    // Pinch-zoom handler: anchored around the pinch centroid.
-                    .pointerInput(Unit) {
-                        detectTransformGestures { centroid, _, zoomDelta, _ ->
-                            val oldZoom = zoom
-                            val newZoom = (oldZoom * zoomDelta).coerceIn(1f, 20f)
-                            if (newZoom != oldZoom) {
-                                zoom = newZoom
-                                val maxScroll = ((baseWidthPx * newZoom) - baseWidthPx)
-                                    .coerceAtLeast(0f).roundToInt()
-                                val rawScroll =
-                                    (scrollState.value + centroid.x) * (newZoom / oldZoom) - centroid.x
-                                scope.launch {
-                                    scrollState.scrollTo(rawScroll.roundToInt().coerceIn(0, maxScroll))
-                                }
-                            }
-                        }
-                    }
-            ) {
-                Canvas(modifier = Modifier.width(baseWidth * zoom).fillMaxHeight()) {
-                    val cy = size.height / 2f
-                    drawLine(
-                        color = outline.copy(alpha = 0.35f),
-                        start = Offset(0f, cy),
-                        end = Offset(size.width, cy),
-                        strokeWidth = 2.dp.toPx()
-                    )
-                    frameTimestampsMs.forEachIndexed { i, tsMs ->
-                        val x = (tsMs.toFloat() / videoDurationMs) * size.width
-                        val isHl = i == highlightIndex
-                        val halfH = if (isHl) 16.dp.toPx() else 10.dp.toPx()
-                        drawLine(
-                            color = if (isHl) primary else primary.copy(alpha = 0.65f),
-                            start = Offset(x, cy - halfH),
-                            end = Offset(x, cy + halfH),
-                            strokeWidth = if (isHl) 3.dp.toPx() else 1.5.dp.toPx()
-                        )
-                    }
-                }
-            }
-        }
-        AnimatedVisibility(visible = zoom > 1f) {
-            IconButton(
-                onClick = { zoom = 1f; scope.launch { scrollState.scrollTo(0) } },
-                modifier = Modifier.size(40.dp)
-            ) {
-                Icon(
-                    imageVector = Icons.Default.ZoomOut,
-                    contentDescription = "Reset zoom",
-                    modifier = Modifier.size(20.dp),
-                    tint = MaterialTheme.colorScheme.primary
-                )
-            }
-        }
-    }
-}
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
-private fun formatTimestamp(ms: Long): String {
-    val s = ms / 1000
-    return "%d:%02d".format(s / 60, s % 60)
-}
-
-@Composable
-private fun StatChip(label: String, value: Int, modifier: Modifier = Modifier) {
-    Card(
-        modifier = modifier,
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
-    ) {
-        Column(
-            modifier = Modifier.padding(vertical = 8.dp, horizontal = 4.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            Text(
-                value.toString(),
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.Bold
-            )
-            Text(
-                label,
-                style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
         }
     }
 }
@@ -838,4 +983,22 @@ fun ErrorScreen(message: String, onDismiss: () -> Unit) {
         Spacer(Modifier.height(24.dp))
         Button(onClick = onDismiss) { Text("Try again") }
     }
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+private fun formatTimestamp(ms: Long): String {
+    val s = ms / 1000
+    return "%d:%02d".format(s / 60, s % 60)
+}
+
+private fun <T> List<T>.indexOfMinBy(selector: (T) -> Long): Int {
+    if (isEmpty()) return -1
+    var minIdx = 0
+    var minVal = selector(this[0])
+    for (i in 1..lastIndex) {
+        val v = selector(this[i])
+        if (v < minVal) { minVal = v; minIdx = i }
+    }
+    return minIdx
 }

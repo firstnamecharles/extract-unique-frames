@@ -4,7 +4,6 @@ import android.app.Application
 import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -14,7 +13,12 @@ class ExtractViewModel(application: Application) : AndroidViewModel(application)
 
     sealed class UiState {
         object Idle : UiState()
-        data class Processing(val progress: Float, val framesFound: Int) : UiState()
+        data class Capturing(
+            val videoUri: Uri,
+            val videoDurationMs: Long = 0L,
+            val capturedUris: List<Uri> = emptyList(),
+            val capturedTimestampsMs: List<Long> = emptyList()
+        ) : UiState()
         data class Done(val result: FrameExtractor.Result) : UiState()
         data class Error(val message: String) : UiState()
     }
@@ -22,42 +26,36 @@ class ExtractViewModel(application: Application) : AndroidViewModel(application)
     private val _state = MutableStateFlow<UiState>(UiState.Idle)
     val state: StateFlow<UiState> = _state.asStateFlow()
 
-    /** Persists the user's mode selection across Idle → Processing → Done cycles. */
-    private val _mode = MutableStateFlow(FrameExtractor.Mode.INTERVAL)
-    val mode: StateFlow<FrameExtractor.Mode> = _mode.asStateFlow()
-
     private val extractor = FrameExtractor(application)
-    private var job: Job? = null
 
-    fun setMode(mode: FrameExtractor.Mode) {
-        _mode.value = mode
+    fun startCapturing(videoUri: Uri, durationMs: Long) {
+        _state.value = UiState.Capturing(videoUri = videoUri, videoDurationMs = durationMs)
     }
 
-    fun startExtraction(videoUri: Uri, config: FrameExtractor.Config) {
-        job?.cancel()
-        job = viewModelScope.launch {
-            _state.value = UiState.Processing(0f, 0)
+    fun captureFrame(positionMs: Long) {
+        val current = _state.value as? UiState.Capturing ?: return
+        viewModelScope.launch {
             try {
-                val result = extractor.extract(
-                    videoUri = videoUri,
-                    config = config,
-                    onProgress = { progress, framesFound ->
-                        _state.value = UiState.Processing(progress, framesFound)
-                    }
+                val uri = extractor.captureFrame(current.videoUri, positionMs)
+                val s = _state.value as? UiState.Capturing ?: return@launch
+                _state.value = s.copy(
+                    capturedUris = s.capturedUris + uri,
+                    capturedTimestampsMs = s.capturedTimestampsMs + positionMs
                 )
-                _state.value = UiState.Done(result)
-            } catch (e: Exception) {
-                _state.value = UiState.Error(e.message ?: "Unexpected error")
-            }
+            } catch (_: Exception) { /* silent — don't crash on failed capture */ }
         }
     }
 
-    fun cancel() {
-        job?.cancel()
-        _state.value = UiState.Idle
+    fun finish() {
+        val s = _state.value as? UiState.Capturing ?: return
+        _state.value = UiState.Done(
+            FrameExtractor.Result(
+                savedFrames = s.capturedUris,
+                frameTimestampsMs = s.capturedTimestampsMs,
+                videoDurationMs = s.videoDurationMs
+            )
+        )
     }
 
-    fun reset() {
-        _state.value = UiState.Idle
-    }
+    fun reset() { _state.value = UiState.Idle }
 }
