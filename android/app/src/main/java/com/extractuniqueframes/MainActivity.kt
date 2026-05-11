@@ -18,15 +18,20 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.itemsIndexed
 import androidx.compose.foundation.lazy.grid.rememberLazyGridState
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -65,6 +70,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
@@ -90,7 +98,8 @@ fun ExtractUniqueFramesApp(vm: ExtractViewModel = viewModel()) {
 
     when (val s = state) {
         is ExtractViewModel.UiState.Idle -> HomeScreen(
-            onStartCapturing = { uri, durationMs -> vm.startCapturing(uri, durationMs) }
+            onStartCapturing = { uri, durationMs, name -> vm.startCapturing(uri, durationMs, name) },
+            onOpenGallery = { vm.openGallery() }
         )
         is ExtractViewModel.UiState.Capturing -> PlayerScreen(
             videoUri = s.videoUri,
@@ -108,6 +117,14 @@ fun ExtractUniqueFramesApp(vm: ExtractViewModel = viewModel()) {
             message = s.message,
             onDismiss = { vm.reset() }
         )
+        is ExtractViewModel.UiState.Gallery -> GalleryScreen(
+            onOpenProject = { name -> vm.openProject(name) },
+            onBack = { vm.backFromGallery() }
+        )
+        is ExtractViewModel.UiState.ProjectDetail -> ProjectDetailScreen(
+            projectName = s.projectName,
+            onBack = { vm.backFromProject() }
+        )
     }
 }
 
@@ -115,12 +132,13 @@ fun ExtractUniqueFramesApp(vm: ExtractViewModel = viewModel()) {
 
 @Composable
 fun HomeScreen(
-    onStartCapturing: (Uri, Long) -> Unit
+    onStartCapturing: (Uri, Long, String) -> Unit,
+    onOpenGallery: () -> Unit
 ) {
     val context = LocalContext.current
     var selectedUri by remember { mutableStateOf<Uri?>(null) }
     var videoDurationMs by remember { mutableLongStateOf(0L) }
-
+    var showProjectDialog by remember { mutableStateOf(false) }
     var pendingUri by remember { mutableStateOf<Uri?>(null) }
 
     val writePermLauncher = rememberLauncherForActivityResult(
@@ -129,8 +147,7 @@ fun HomeScreen(
         if (granted) {
             val uri = pendingUri
             if (uri != null && videoDurationMs > 0L) {
-                onStartCapturing(uri, videoDurationMs)
-                pendingUri = null
+                showProjectDialog = true
             }
         }
     }
@@ -139,7 +156,6 @@ fun HomeScreen(
         ActivityResultContracts.GetContent()
     ) { uri -> selectedUri = uri }
 
-    // Read duration when URI changes
     LaunchedEffect(selectedUri) {
         val uri = selectedUri ?: return@LaunchedEffect
         videoDurationMs = withContext(Dispatchers.IO) {
@@ -148,24 +164,34 @@ fun HomeScreen(
                 retriever.setDataSource(context, uri)
                 retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
                     ?.toLongOrNull() ?: 0L
-            } catch (_: Exception) {
-                0L
-            } finally {
-                retriever.release()
-            }
+            } catch (_: Exception) { 0L } finally { retriever.release() }
         }
     }
 
-    fun launchCapturing(uri: Uri) {
+    fun requestCaptureStart(uri: Uri) {
+        pendingUri = uri
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q &&
             ContextCompat.checkSelfPermission(context, Manifest.permission.WRITE_EXTERNAL_STORAGE)
                 != PackageManager.PERMISSION_GRANTED
         ) {
-            pendingUri = uri
             writePermLauncher.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
         } else {
-            onStartCapturing(uri, videoDurationMs)
+            showProjectDialog = true
         }
+    }
+
+    if (showProjectDialog) {
+        val defaultName = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.US).format(Date())
+        ProjectNameDialog(
+            defaultName = defaultName,
+            onConfirm = { rawName ->
+                showProjectDialog = false
+                val name = sanitizeProjectName(rawName)
+                val uri = pendingUri ?: selectedUri ?: return@ProjectNameDialog
+                onStartCapturing(uri, videoDurationMs, name)
+            },
+            onDismiss = { showProjectDialog = false }
+        )
     }
 
     Column(
@@ -201,7 +227,6 @@ fun HomeScreen(
 
         Spacer(Modifier.height(8.dp))
 
-        // Video picker card
         Card(
             modifier = Modifier
                 .fillMaxWidth()
@@ -248,9 +273,7 @@ fun HomeScreen(
         Spacer(Modifier.height(8.dp))
 
         Button(
-            onClick = {
-                selectedUri?.let { uri -> launchCapturing(uri) }
-            },
+            onClick = { selectedUri?.let { requestCaptureStart(it) } },
             enabled = selectedUri != null && videoDurationMs > 0L,
             modifier = Modifier.fillMaxWidth(),
             contentPadding = PaddingValues(vertical = 14.dp)
@@ -259,7 +282,45 @@ fun HomeScreen(
             Spacer(Modifier.width(8.dp))
             Text("Start capturing", style = MaterialTheme.typography.labelLarge)
         }
+
+        OutlinedButton(
+            onClick = onOpenGallery,
+            modifier = Modifier.fillMaxWidth(),
+            contentPadding = PaddingValues(vertical = 14.dp)
+        ) {
+            Icon(Icons.Default.PhotoLibrary, contentDescription = null, modifier = Modifier.size(20.dp))
+            Spacer(Modifier.width(8.dp))
+            Text("Gallery", style = MaterialTheme.typography.labelLarge)
+        }
     }
+}
+
+@Composable
+private fun ProjectNameDialog(
+    defaultName: String,
+    onConfirm: (String) -> Unit,
+    onDismiss: () -> Unit
+) {
+    var text by remember { mutableStateOf(defaultName) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Project name") },
+        text = {
+            OutlinedTextField(
+                value = text,
+                onValueChange = { text = it },
+                singleLine = true,
+                label = { Text("Name") },
+                modifier = Modifier.fillMaxWidth()
+            )
+        },
+        confirmButton = {
+            TextButton(onClick = { onConfirm(text) }) { Text("Start") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        }
+    )
 }
 
 // ─── Player ──────────────────────────────────────────────────────────────────
@@ -417,26 +478,32 @@ fun PlayerScreen(
                 .padding(horizontal = 8.dp, vertical = 4.dp)
         )
 
-        // Controls row
+        // Controls row: «« « ⏯ » »»
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .background(MaterialTheme.colorScheme.surface)
-                .padding(horizontal = 16.dp, vertical = 8.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
+                .padding(horizontal = 8.dp, vertical = 4.dp),
+            horizontalArrangement = Arrangement.spacedBy(0.dp, Alignment.CenterHorizontally),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // Step back one frame
+            // Jump back 1 second
+            IconButton(onClick = {
+                val newPos = (positionMs - 1000L).coerceAtLeast(0L)
+                exoPlayer.seekTo(newPos); positionMs = newPos
+            }) {
+                Icon(Icons.Default.FastRewind, contentDescription = "Back 1s", modifier = Modifier.size(20.dp))
+            }
+            // Step back 1 frame
             IconButton(onClick = {
                 val newPos = (positionMs - frameDurationMs).coerceAtLeast(0L)
-                exoPlayer.seekTo(newPos)
-                positionMs = newPos
+                exoPlayer.seekTo(newPos); positionMs = newPos
             }) {
-                Icon(Icons.Default.SkipPrevious, contentDescription = "Step back")
+                Icon(Icons.Default.SkipPrevious, contentDescription = "Back 1 frame", modifier = Modifier.size(20.dp))
             }
 
             // Play/pause
-            IconButton(onClick = {
+            FilledIconButton(onClick = {
                 if (exoPlayer.isPlaying) exoPlayer.pause() else exoPlayer.play()
             }) {
                 Icon(
@@ -445,14 +512,22 @@ fun PlayerScreen(
                 )
             }
 
-            // Step forward one frame
+            // Step forward 1 frame
             IconButton(onClick = {
                 val newPos = (positionMs + frameDurationMs).coerceAtMost(videoDurationMs)
-                exoPlayer.seekTo(newPos)
-                positionMs = newPos
+                exoPlayer.seekTo(newPos); positionMs = newPos
             }) {
-                Icon(Icons.Default.SkipNext, contentDescription = "Step forward")
+                Icon(Icons.Default.SkipNext, contentDescription = "Forward 1 frame", modifier = Modifier.size(20.dp))
             }
+            // Jump forward 1 second
+            IconButton(onClick = {
+                val newPos = (positionMs + 1000L).coerceAtMost(videoDurationMs)
+                exoPlayer.seekTo(newPos); positionMs = newPos
+            }) {
+                Icon(Icons.Default.FastForward, contentDescription = "Forward 1s", modifier = Modifier.size(20.dp))
+            }
+
+            Spacer(Modifier.width(8.dp))
 
             // Time display
             Text(
@@ -810,7 +885,7 @@ fun ResultsScreen(result: FrameExtractor.Result, onStartOver: () -> Unit) {
                     tint = MaterialTheme.colorScheme.onSurfaceVariant
                 )
                 Text(
-                    "Saved to: ${FrameExtractor.SAVE_FOLDER}",
+                    "Saved to: ${FrameExtractor.SAVE_FOLDER_BASE}/${result.projectName}",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -912,8 +987,10 @@ fun ResultsScreen(result: FrameExtractor.Result, onStartOver: () -> Unit) {
     }
 
     // Full-screen detail dialog
+    var pdfResult by remember { mutableStateOf<Uri?>(null) }
     selectedFrameIndex?.let { idx ->
         val uri = result.savedFrames[idx]
+        val tsMs = result.frameTimestampsMs[idx]
         Dialog(
             onDismissRequest = { selectedFrameIndex = null },
             properties = DialogProperties(usePlatformDefaultWidth = false)
@@ -931,9 +1008,8 @@ fun ResultsScreen(result: FrameExtractor.Result, onStartOver: () -> Unit) {
                     contentScale = ContentScale.Fit,
                     modifier = Modifier.fillMaxSize()
                 )
-                // Timestamp badge
                 Text(
-                    text = formatTimestamp(result.frameTimestampsMs[idx]),
+                    text = formatTimestamp(tsMs),
                     modifier = Modifier
                         .align(Alignment.TopStart)
                         .padding(12.dp)
@@ -943,23 +1019,47 @@ fun ResultsScreen(result: FrameExtractor.Result, onStartOver: () -> Unit) {
                     style = MaterialTheme.typography.bodyMedium,
                     fontWeight = FontWeight.SemiBold
                 )
-                FloatingActionButton(
-                    onClick = {
-                        val intent = Intent(Intent.ACTION_SEND).apply {
-                            type = "image/jpeg"
-                            putExtra(Intent.EXTRA_STREAM, uri)
-                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-                        }
-                        context.startActivity(Intent.createChooser(intent, "Share frame"))
-                    },
-                    modifier = Modifier
-                        .align(Alignment.BottomEnd)
-                        .padding(24.dp)
+                Row(
+                    modifier = Modifier.align(Alignment.BottomEnd).padding(24.dp),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
-                    Icon(Icons.Default.Share, contentDescription = "Share")
+                    // Print single frame
+                    SmallFloatingActionButton(
+                        onClick = {
+                            scope.launch {
+                                val frame = ProjectFrame(uri, tsMs, "frame_%08d.jpg".format(tsMs))
+                                val pdf = generatePdf(context, listOf(frame), result.projectName)
+                                pdfResult = pdf
+                            }
+                        },
+                        containerColor = MaterialTheme.colorScheme.secondaryContainer
+                    ) {
+                        Icon(Icons.Default.Print, contentDescription = "Print frame",
+                            tint = MaterialTheme.colorScheme.onSecondaryContainer)
+                    }
+                    FloatingActionButton(
+                        onClick = {
+                            val intent = Intent(Intent.ACTION_SEND).apply {
+                                type = "image/jpeg"
+                                putExtra(Intent.EXTRA_STREAM, uri)
+                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            }
+                            context.startActivity(Intent.createChooser(intent, "Share frame"))
+                        }
+                    ) {
+                        Icon(Icons.Default.Share, contentDescription = "Share")
+                    }
                 }
             }
         }
+    }
+
+    pdfResult?.let { pdfUri ->
+        PdfResultDialog(
+            pdfUri = pdfUri,
+            title = result.projectName,
+            onDismiss = { pdfResult = null }
+        )
     }
 }
 
@@ -992,6 +1092,304 @@ fun ErrorScreen(message: String, onDismiss: () -> Unit) {
         Spacer(Modifier.height(24.dp))
         Button(onClick = onDismiss) { Text("Try again") }
     }
+}
+
+// ─── Gallery ─────────────────────────────────────────────────────────────────
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun GalleryScreen(onOpenProject: (String) -> Unit, onBack: () -> Unit) {
+    val context = LocalContext.current
+    var projects by remember { mutableStateOf<List<ProjectInfo>>(emptyList()) }
+    var loading by remember { mutableStateOf(true) }
+
+    LaunchedEffect(Unit) {
+        projects = loadProjects(context)
+        loading = false
+    }
+
+    Column(modifier = Modifier.fillMaxSize()) {
+        TopAppBar(
+            title = { Text("Gallery") },
+            navigationIcon = {
+                IconButton(onClick = onBack) {
+                    Icon(Icons.Default.ArrowBack, contentDescription = "Back")
+                }
+            }
+        )
+        if (loading) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                CircularProgressIndicator()
+            }
+        } else if (projects.isEmpty()) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Icon(Icons.Default.FolderOpen, contentDescription = null,
+                        modifier = Modifier.size(64.dp),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Spacer(Modifier.height(12.dp))
+                    Text("No projects yet", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+        } else {
+            LazyColumn(contentPadding = PaddingValues(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                items(projects) { project ->
+                    Card(
+                        modifier = Modifier.fillMaxWidth().clickable { onOpenProject(project.name) }
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            AsyncImage(
+                                model = project.thumbnailUri,
+                                contentDescription = null,
+                                contentScale = ContentScale.Crop,
+                                modifier = Modifier.size(64.dp).clip(RoundedCornerShape(8.dp))
+                            )
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(project.name, style = MaterialTheme.typography.titleSmall,
+                                    fontWeight = FontWeight.SemiBold)
+                                Text("${project.frameCount} frames",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            }
+                            Icon(Icons.Default.ChevronRight, contentDescription = null,
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ─── Project Detail ───────────────────────────────────────────────────────────
+
+@OptIn(ExperimentalFoundationApi::class, ExperimentalMaterial3Api::class)
+@Composable
+fun ProjectDetailScreen(projectName: String, onBack: () -> Unit) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var frames by remember { mutableStateOf<List<ProjectFrame>>(emptyList()) }
+    var loading by remember { mutableStateOf(true) }
+    var selectedIndices by remember { mutableStateOf<Set<Int>>(emptySet()) }
+    var multiSelectMode by remember { mutableStateOf(false) }
+    var detailIndex by remember { mutableStateOf<Int?>(null) }
+    var pdfResult by remember { mutableStateOf<Uri?>(null) }
+    var generatingPdf by remember { mutableStateOf(false) }
+
+    LaunchedEffect(projectName) {
+        frames = loadProjectFrames(context, projectName)
+        loading = false
+    }
+
+    fun exitMultiSelect() { multiSelectMode = false; selectedIndices = emptySet() }
+
+    Column(modifier = Modifier.fillMaxSize()) {
+        if (multiSelectMode) {
+            TopAppBar(
+                title = { Text("${selectedIndices.size} selected") },
+                navigationIcon = {
+                    IconButton(onClick = ::exitMultiSelect) {
+                        Icon(Icons.Default.Close, contentDescription = "Cancel selection")
+                    }
+                },
+                actions = {
+                    if (selectedIndices.isNotEmpty()) {
+                        IconButton(
+                            onClick = {
+                                if (!generatingPdf) {
+                                    generatingPdf = true
+                                    val selected = selectedIndices.sorted().map { frames[it] }
+                                    scope.launch {
+                                        pdfResult = generatePdf(context, selected, projectName)
+                                        generatingPdf = false
+                                    }
+                                }
+                            }
+                        ) {
+                            if (generatingPdf) {
+                                CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                            } else {
+                                Icon(Icons.Default.PictureAsPdf, contentDescription = "Export PDF")
+                            }
+                        }
+                        IconButton(onClick = { selectedIndices = frames.indices.toSet() }) {
+                            Icon(Icons.Default.SelectAll, contentDescription = "Select all")
+                        }
+                    }
+                }
+            )
+        } else {
+            TopAppBar(
+                title = { Text(projectName) },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.Default.ArrowBack, contentDescription = "Back")
+                    }
+                }
+            )
+        }
+
+        if (loading) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                CircularProgressIndicator()
+            }
+        } else {
+            LazyVerticalGrid(
+                columns = GridCells.Fixed(3),
+                contentPadding = PaddingValues(4.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+                modifier = Modifier.fillMaxSize()
+            ) {
+                itemsIndexed(frames) { idx, frame ->
+                    val isSelected = idx in selectedIndices
+                    Box(
+                        modifier = Modifier
+                            .aspectRatio(1f)
+                            .clip(RoundedCornerShape(4.dp))
+                            .combinedClickable(
+                                onLongClick = {
+                                    multiSelectMode = true
+                                    selectedIndices = setOf(idx)
+                                },
+                                onClick = {
+                                    if (multiSelectMode) {
+                                        selectedIndices = if (isSelected)
+                                            selectedIndices - idx else selectedIndices + idx
+                                    } else {
+                                        detailIndex = idx
+                                    }
+                                }
+                            )
+                    ) {
+                        AsyncImage(
+                            model = frame.uri,
+                            contentDescription = null,
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier.fillMaxSize()
+                        )
+                        Text(
+                            text = formatTimestamp(frame.timestampMs),
+                            modifier = Modifier
+                                .align(Alignment.BottomStart)
+                                .background(Color.Black.copy(alpha = 0.55f))
+                                .padding(horizontal = 3.dp, vertical = 1.dp),
+                            color = Color.White,
+                            style = MaterialTheme.typography.labelSmall
+                        )
+                        if (isSelected) {
+                            Box(
+                                modifier = Modifier.fillMaxSize()
+                                    .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.35f))
+                            )
+                            Icon(
+                                Icons.Default.CheckCircle,
+                                contentDescription = null,
+                                tint = Color.White,
+                                modifier = Modifier.align(Alignment.TopEnd).padding(4.dp).size(20.dp)
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Detail dialog
+    detailIndex?.let { idx ->
+        val frame = frames[idx]
+        Dialog(
+            onDismissRequest = { detailIndex = null },
+            properties = DialogProperties(usePlatformDefaultWidth = false)
+        ) {
+            Box(
+                modifier = Modifier.fillMaxSize().background(Color.Black)
+                    .clickable { detailIndex = null },
+                contentAlignment = Alignment.Center
+            ) {
+                AsyncImage(
+                    model = frame.uri, contentDescription = null,
+                    contentScale = ContentScale.Fit, modifier = Modifier.fillMaxSize()
+                )
+                Text(
+                    text = formatTimestamp(frame.timestampMs),
+                    modifier = Modifier.align(Alignment.TopStart).padding(12.dp)
+                        .background(Color.Black.copy(alpha = 0.6f), RoundedCornerShape(4.dp))
+                        .padding(horizontal = 8.dp, vertical = 4.dp),
+                    color = Color.White, style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Row(
+                    modifier = Modifier.align(Alignment.BottomEnd).padding(24.dp),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    SmallFloatingActionButton(
+                        onClick = {
+                            scope.launch {
+                                val pdf = generatePdf(context, listOf(frame), projectName)
+                                pdfResult = pdf
+                                detailIndex = null
+                            }
+                        },
+                        containerColor = MaterialTheme.colorScheme.secondaryContainer
+                    ) {
+                        Icon(Icons.Default.Print, contentDescription = "Print",
+                            tint = MaterialTheme.colorScheme.onSecondaryContainer)
+                    }
+                    FloatingActionButton(onClick = {
+                        val intent = Intent(Intent.ACTION_SEND).apply {
+                            type = "image/jpeg"
+                            putExtra(Intent.EXTRA_STREAM, frame.uri)
+                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        }
+                        context.startActivity(Intent.createChooser(intent, "Share frame"))
+                    }) {
+                        Icon(Icons.Default.Share, contentDescription = "Share")
+                    }
+                }
+            }
+        }
+    }
+
+    pdfResult?.let { uri ->
+        PdfResultDialog(pdfUri = uri, title = projectName, onDismiss = { pdfResult = null })
+    }
+}
+
+// ─── PDF Result Dialog ────────────────────────────────────────────────────────
+
+@Composable
+private fun PdfResultDialog(pdfUri: Uri, title: String, onDismiss: () -> Unit) {
+    val context = LocalContext.current
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        icon = { Icon(Icons.Default.PictureAsPdf, contentDescription = null) },
+        title = { Text("PDF saved") },
+        text = { Text("Saved to Documents/ExtractUniqueFrames/") },
+        confirmButton = {
+            TextButton(onClick = {
+                onDismiss()
+                launchPrint(context, pdfUri, title)
+            }) { Text("Print") }
+        },
+        dismissButton = {
+            Row {
+                TextButton(onClick = onDismiss) { Text("Close") }
+                TextButton(onClick = {
+                    onDismiss()
+                    val intent = Intent(Intent.ACTION_VIEW).apply {
+                        setDataAndType(pdfUri, "application/pdf")
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    }
+                    context.startActivity(intent)
+                }) { Text("Open") }
+            }
+        }
+    )
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
