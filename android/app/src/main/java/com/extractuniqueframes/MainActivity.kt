@@ -505,16 +505,6 @@ fun VideoTimeline(
     val colorTertiary = MaterialTheme.colorScheme.tertiary
     val colorOnSurface = MaterialTheme.colorScheme.onSurface
 
-    // Auto-scroll to keep playhead centred
-    LaunchedEffect(positionMs, zoom) {
-        if (zoom > 1f && !isDragging && durationMs > 0L) {
-            val baseWidthPx = with(density) {
-                // We'll compute after we know the actual size, so we approximate
-                // This will be updated in BoxWithConstraints
-            }
-        }
-    }
-
     Column(modifier = modifier) {
         BoxWithConstraints(
             modifier = Modifier
@@ -540,25 +530,28 @@ fun VideoTimeline(
                 modifier = Modifier
                     .fillMaxSize()
                     .horizontalScroll(scrollState, enabled = false)
-                    .pointerInput(durationMs) {
+                    .pointerInput(durationMs, capturedTimestampsMs) {
+                        val snapRadiusPx = 18.dp.toPx()
                         awaitEachGesture {
                             val down = awaitFirstDown(requireUnconsumed = false)
                             isDragging = true
 
-                            // Seek on initial down
-                            val contentX = scrollState.value.toFloat() + down.position.x
                             val contentWidthPx = baseWidthPx * zoom
-                            val seekMs = ((contentX / contentWidthPx) * durationMs)
-                                .toLong()
-                                .coerceIn(0L, durationMs)
+                            val downContentX = scrollState.value.toFloat() + down.position.x
+                            val downSeekMs = ((downContentX / contentWidthPx) * durationMs)
+                                .toLong().coerceIn(0L, durationMs)
+
+                            // Seek on initial down
                             val now = System.currentTimeMillis()
                             if (now - lastSeekMs >= 100L) {
-                                onSeek(seekMs)
+                                onSeek(downSeekMs)
                                 lastSeekMs = now
                             }
 
                             var prevSpan = 0f
                             var prevCentroidX = down.position.x
+                            var totalMovement = 0f
+                            var lastPos = down.position
 
                             try {
                                 while (true) {
@@ -569,10 +562,11 @@ fun VideoTimeline(
                                     if (pointers.size == 1) {
                                         // Single finger: seek
                                         val finger = pointers[0]
+                                        totalMovement += abs(finger.position.x - lastPos.x)
+                                        lastPos = finger.position
                                         val cx = scrollState.value.toFloat() + finger.position.x
                                         val sm = ((cx / (baseWidthPx * zoom)) * durationMs)
-                                            .toLong()
-                                            .coerceIn(0L, durationMs)
+                                            .toLong().coerceIn(0L, durationMs)
                                         val nowMs = System.currentTimeMillis()
                                         if (nowMs - lastSeekMs >= 100L) {
                                             onSeek(sm)
@@ -582,6 +576,7 @@ fun VideoTimeline(
                                         prevSpan = 0f
                                     } else if (pointers.size >= 2) {
                                         // Two fingers: pinch zoom
+                                        totalMovement = Float.MAX_VALUE // not a tap
                                         val p0 = pointers[0].position
                                         val p1 = pointers[1].position
                                         val span = abs(p1.x - p0.x)
@@ -598,8 +593,7 @@ fun VideoTimeline(
                                                 val anchorInContent = scrollState.value + centroidX
                                                 val scaledAnchor = anchorInContent * (newZoom / oldZoom)
                                                 val newScroll = (scaledAnchor - centroidX)
-                                                    .roundToInt()
-                                                    .coerceIn(0, maxScroll)
+                                                    .roundToInt().coerceIn(0, maxScroll)
                                                 scope.launch { scrollState.scrollTo(newScroll) }
                                             }
                                         }
@@ -608,6 +602,19 @@ fun VideoTimeline(
                                     }
                                 }
                             } finally {
+                                // Snap to nearest captured tick on short taps
+                                if (totalMovement < snapRadiusPx && capturedTimestampsMs.isNotEmpty()) {
+                                    val snapped = capturedTimestampsMs.minByOrNull { tsMs ->
+                                        val tickX = (tsMs.toFloat() / durationMs) * contentWidthPx
+                                        abs(tickX - downContentX)
+                                    }
+                                    if (snapped != null) {
+                                        val tickX = (snapped.toFloat() / durationMs) * contentWidthPx
+                                        if (abs(tickX - downContentX) <= snapRadiusPx) {
+                                            onSeek(snapped)
+                                        }
+                                    }
+                                }
                                 isDragging = false
                             }
                         }
